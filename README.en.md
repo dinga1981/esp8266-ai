@@ -1,3 +1,7 @@
+> This English README is inherited from the upstream project and does not yet document all
+> features of the enhanced edition. See the current [Chinese README](README.md),
+> [changelog](CHANGELOG.md), and [upstream notice](NOTICE.md).
+
 <p align="center">
   <img src="docs/images/logo.svg" width="72" alt="logo">
 </p>

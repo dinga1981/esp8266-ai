@@ -2,88 +2,131 @@
   <img src="docs/images/logo.svg" width="72" alt="logo">
 </p>
 
-<h1 align="center">AI Mac 小屏幕</h1>
+<h1 align="center">ESP8266 AI 行情小屏增强版</h1>
 
-<p align="center">桌上的一台 AI 状态小电脑 —— ESP8266 · 开源硬件 · 桌面伴侣</p>
-
-<p align="center">
-  中文 ·
-  <a href="README.en.md">English</a>
-</p>
+<p align="center">Codex 状态 · 多市场报价 · K 线行情 · 日期天气 · 自定义轮播</p>
 
 <p align="center">
-  <a href="https://mac.qust.me">官网</a> ·
-  <a href="https://mac.qust.me/#flash">网页刷机</a> ·
-  <a href="https://github.com/pengchujin/esp8266-ai/releases/latest">下载</a>
+  <a href="https://github.com/dinga1981/esp8266-ai/releases/latest">下载最新版</a> ·
+  <a href="CHANGELOG.md">版本记录</a> ·
+  <a href="https://github.com/pengchujin/esp8266-ai">原作者项目</a>
 </p>
 
-<p align="center">
-  <img src="docs/images/hero.jpg" width="640" alt="AI Mac 小屏幕">
-</p>
+> 当前增强版：`v0.5.7`。本项目从
+> [`pengchujin/esp8266-ai`](https://github.com/pengchujin/esp8266-ai) 的
+> `v0.4.9` 分支发展，增强版版本号与上游版本号独立。上游后续功能会按需移植，
+> 不会自动合并覆盖本项目功能。
 
-一块 240×240 的复古小电视，放在桌上实时显示 **Claude Code / Codex CLI 在干什么、额度还剩多少**。不需要任何 API key：数据来自本机已有的 CLI 登录凭据和会话日志，由配套的 Mac / Windows 桥接程序在局域网内提供给设备。
+这是为 240×240 ST7789 小电视屏幕设计的 ESP8266 固件和 macOS 菜单栏桥接程序。
+设备通过局域网从 Mac 获取 Codex 状态、行情和天气数据，再由 ESP8266 独立绘制各个页面。
 
-## 功能
+## v0.5.7 主要功能
 
-| | |
-|---|---|
-| <img src="docs/images/feature1.jpg" width="360" alt="AI 工作状态"> | **AI 工作状态与额度**<br>桌宠动起来 = AI 正在干活。方形进度环 + 大字显示 5 小时 / 周额度的真实用量；额度用满自动换成重置倒计时，等你审批时整圈边框红闪提醒。 |
-| <img src="docs/images/feature2.jpg" width="360" alt="网速监视"> | **网速实时监视**<br>任务管理器风格的上下行曲线，56 秒滚动窗口，量程自动调整。 |
-| <img src="docs/images/music.jpg" width="360" alt="音乐播放"> | **音乐播放显示**<br>专辑封面、歌名、歌手、进度条实时同步；音乐响起自动切入，停止自动切回。 |
-| <img src="docs/images/feature3.jpg" width="360" alt="桌宠可换"> | **可换桌宠**<br>内置 [petdex.dev](https://petdex.dev) 画廊 3300+ 开源桌宠，也可上传任意 GIF，设备板上直接解码，无需重烧固件。 |
+- **Codex 状态与额度**：Nothing 风格点阵数字、5 小时/周额度、重置倒计时和等待审批提醒。
+- **四行报价**：一页最多显示 4 个 A 股、港股、美股、国内外期货、伦敦金、离岸人民币或美元指数。
+- **全屏 K 线**：支持 1、5、60 分钟周期，最多收藏 15 个标的，支持添加和删除收藏。
+- **多市场行情**：BTC/ETH、A 股、港股、美股、韩股、主要指数、国内期货、海外期货、伦敦金、离岸人民币和美元指数。
+- **稳定轮换**：K 线下一标的提前加载，完整校验后一次切屏；接口失败时跳过，不拖住整个轮换。
+- **日期天气**：城市、月日、星期、时分秒、当前天气与温度，以及今日和明日预报。
+- **按星期自动轮播**：工作日和周末可分别选择页面及 5/10/30/60/120 秒间隔；进入 K 线页后会等待收藏完整展示一轮。
+- **音乐和桌宠**：保留上游音乐显示、自定义 GIF 桌宠、亮度控制和实时屏幕预览。
 
-## 快速上手
+`v0.5.7` 的菜单中暂时隐藏 Claude 页面和网速页面，但底层代码仍保留。增强功能目前仅适配
+macOS 桥接程序；仓库中的 Windows 桥接程序沿用上游代码，不包含上述新增行情和天气能力。
 
-需要的东西：一台「SD2 小电视」开发板（[开源硬件](https://oshwhub.com/q21182889/sd2)，也可[直接购买成品](https://mobile.yangkeduo.com/goods.html?ps=OuBjGMWE82)）、一根 USB **数据**线。
+## 硬件要求
 
-### 第 1 步 · 刷固件（约 30 秒）
+- ESP8266 / ESP-12E / NodeMCU v2 兼容板
+- 240×240 ST7789 SPI 屏幕
+- 项目所用 SD2 小电视引脚配置见 `firmware/platformio.ini`
 
-用 Chrome / Edge 打开 **[mac.qust.me/#flash](https://mac.qust.me/#flash)**，USB 连接设备，点「连接设备并烧录」，选择串口等待完成即可，无需安装任何工具。
+本固件面向 **ESP8266**，不适用于 ESP32-C3，也不能直接刷入采用不同引脚定义的开发板。
 
-> 弹窗里看不到串口？Windows 需要装 [CH340 驱动](https://www.wch.cn/downloads/CH341SER_EXE.html)，Mac 系统自带无需安装；换根 USB 线（很多线只能充电）；更多排查见[官网 FAQ](https://mac.qust.me/#flash-faq)。
->
-> 命令行党也可以用 esptool 把 [Releases](https://github.com/pengchujin/esp8266-ai/releases/latest) 里的 `esp8266-ai-firmware-*.bin` 刷到 `0x0`。
+## 快速使用
 
-### 第 2 步 · 配 WiFi
+1. 从 [Releases](https://github.com/dinga1981/esp8266-ai/releases/latest) 下载对应版本的 Web 刷机包和 Mac 桥接程序。
+2. 使用 Chrome 或 Edge 打开刷机包中的网页，选择 ESP8266 串口并烧录；从旧版本升级时不要擦除设备，以保留 Wi-Fi 和设置。
+3. 首次启动后连接设备创建的 `AI-Clock-Setup` 热点，在 `192.168.4.1` 完成 Wi-Fi 配置。
+4. 解压并启动 `AIClockBridge.app`，允许本地网络访问。
+5. 右键菜单配置四行报价、K 线收藏、天气城市以及工作日/周末自动轮播。
 
-设备首次开机会开热点 **`AI-Clock-Setup`**：手机连上后自动弹出配网页（没弹就用浏览器打开 `192.168.4.1`），选择家里 WiFi、输入密码，完成。
+macOS 首次阻止打开时，可在“系统设置 → 隐私与安全性”中选择允许。
 
-### 第 3 步 · 装桥接程序
+## 行情代码
 
-从 [Releases](https://github.com/pengchujin/esp8266-ai/releases/latest) 下载并打开：
+### 四行报价
 
-- **macOS**：`AIClockBridge-*-macOS.dmg`，拖入 Applications（ad-hoc 签名，首次启动需在「系统设置 → 隐私与安全性」允许，并同意本地网络权限）
-- **Windows**：`AIClockBridge-*-Windows-x64.exe`，双击即用
+用英文逗号分隔，设备最多显示前 4 项：
 
-桥接程序常驻菜单栏 / 托盘，会**自动发现并配对**同一局域网内的设备——到这里屏幕就活了。
-
-<p align="center">
-  <img src="docs/images/working.jpg" width="640" alt="工作演示">
-</p>
-
-日常使用都在托盘图标上：**左键**打开设备画面的实时镜像（底部有屏幕亮度滑条），**右键**是完整菜单（额度详情、屏幕切换、更换桌宠、音乐/网速页等）。
-
-## 常见问题
-
-- **屏幕边框红色闪烁**：设备连不上桥接程序——确认电脑端程序在运行、和设备在同一 WiFi。
-- **额度一直显示 `-`**：本机没有登录过 Claude Code / Codex CLI，桥接程序读不到凭据。
-- **想换桌宠**：右键托盘图标 → 「更换桌宠动画…」，挑一个点上传就行。
-
-## 开发
-
+```text
+sh000001,hk00700,usAAPL,fxXAUUSD
+fxXAUUSD,sfAU0,fxUSDCNH,fxDXY
 ```
-firmware/     ESP8266 固件（PlatformIO + Arduino，含板上 GIF 解码）
-mac-app/      macOS 菜单栏桥接（Swift/SPM，零第三方依赖）
-windows-app/  Windows 托盘桥接（C# / .NET 8 WinForms）
-tools/        GIF → RGB565 内置精灵图转换脚本
-docs/         开发文档（硬件引脚、HTTP API、架构细节）
+
+| 前缀 | 市场 | 示例 |
+|---|---|---|
+| `sh` / `sz` / `bj` | A 股 | `sh600519` |
+| `hk` | 港股 | `hk00700` |
+| `us` | 美股 | `usAAPL` |
+| `fx` | 贵金属/汇率/美元指数 | `fxXAUUSD`、`fxUSDCNH`、`fxDXY` |
+| `sf` / `df` / `zf` / `cf` / `gf` | 国内期货市场 | `sfAU0`、`dfI0`、`cfIF0` |
+| `hf` | 海外期货 | `hfGC`、`hfCL` |
+
+### K 线收藏
+
+右键菜单选择“搜索/添加 K线标的…”。支持常见代码和中文别名，例如：
+
+```text
+BTC  ETH  sh000001  hk00700  usAAPL  kr005930
+fxXAUUSD  fxUSDCNH  fxDXY  sfAU2608  sfAU0  hfGC
 ```
+
+行情来自公开免密接口，可能存在延迟、限流或临时不可用，仅适合信息展示，不应用作自动交易依据。
+
+## 本地构建
+
+### macOS 桥接程序
+
+需要 macOS 12 或更高版本和 Swift 5.9：
 
 ```bash
-cd firmware && pio run -t upload   # 固件：编译 + USB 烧录
-cd mac-app && swift run            # Mac 桥接：本地跑起来
+cd mac-app
+swift test
+swift build -c release --arch arm64
 ```
 
-硬件引脚表、屏幕驱动的坑、设备 HTTP API、GIF 板上解码架构等细节见 **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**。
+### ESP8266 固件
 
-硬件、固件、软件全部开源，拿去改、拿去做、拿去卖都行。
+需要 PlatformIO：
+
+```bash
+cd firmware
+pio run
+```
+
+默认环境为 `nodemcuv2`。实际刷写前请确认屏幕引脚和 Flash 布局与目标硬件一致。
+
+## 目录
+
+```text
+firmware/     ESP8266 固件（PlatformIO + Arduino）
+mac-app/      macOS 菜单栏桥接（Swift Package Manager）
+windows-app/  上游 Windows 桥接代码，未同步本增强版功能
+tools/        图片和精灵图辅助工具
+docs/         硬件、接口和开发文档
+```
+
+## 版本与上游关系
+
+- 上游作者：[pengchujin](https://github.com/pengchujin)
+- 上游仓库：[pengchujin/esp8266-ai](https://github.com/pengchujin/esp8266-ai)
+- 增强版分叉基线：上游 `v0.4.9`
+- 上游 `v0.4.10`、`v0.4.11` 中与 Claude/Codex 额度页相关的改动已在增强版 `v0.5.5` 中按需移植。
+- `v0.5.1` 至 `v0.5.7` 是根据本地留存源码快照重建的历史提交；它们不是开发当时自动保存的原始 Git 提交。
+
+详细说明见 [NOTICE.md](NOTICE.md) 和 [CHANGELOG.md](CHANGELOG.md)。
+
+## 授权说明
+
+上游仓库目前未提供标准 `LICENSE` 文件，因此本仓库不擅自为整套派生代码添加新的许可证。
+原始代码、图片和文档的权利归其各自作者所有；使用、再分发或商用前，请同时核对上游说明并自行确认授权范围。
