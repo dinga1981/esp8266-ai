@@ -73,8 +73,16 @@ unsigned long lastSwitchMs = 0;
 // Display override, settable from the Mac app via POST /api/display:
 // auto = follow working status, claude/codex = pin that app on screen,
 // net/music = show Mac-side telemetry pages instead of the pet.
-enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK };
+enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK, MODE_MARKET };
 DisplayMode displayMode = MODE_AUTO;
+
+// AUTO is a user-configurable carousel. Bit N selects DisplayMode N; AUTO
+// itself is never a carousel page. Default preserves the original two-pet
+// experience until the user changes it from the Mac menu.
+uint8_t autoPageMask = (1U << MODE_CLAUDE) | (1U << MODE_CODEX);
+uint16_t autoCycleSeconds = AUTO_CYCLE_DEFAULT_SECONDS;
+uint8_t autoPageIndex = 0;
+unsigned long autoPageStartedMs = 0;
 
 // When AUTO and the Mac reports audio playing, the screen auto-switches to the
 // music page and back when it stops — same spirit as the Claude/Codex auto
@@ -140,6 +148,22 @@ unsigned long lastStockPollMs = 0;
 const int STOCK_NAME_W = 156, STOCK_NAME_H = 16;
 int stockNamesRev = -1;
 int stockNamesDrawnRev = -1;
+
+// ---------- full-screen K-line market mode ----------
+// This is a separate page from the four-row stock page above. Unlike the
+// ESP32-C3 implementation, the ESP8266 does not reserve a permanent 32 KB
+// frame buffer. It allocates the compressed frame only during an update,
+// validates the entire envelope and CRC, draws one row at a time through the
+// existing 480-byte rowBuf, then immediately releases the allocation.
+const unsigned long MARKET_POLL_INTERVAL_MS = 1000;
+const unsigned long MARKET_HTTP_TIMEOUT_MS = 2500;
+const unsigned long MARKET_READ_TIMEOUT_MS = 1200;
+const unsigned long MARKET_TOTAL_TIMEOUT_MS = 5000;
+const size_t MARKET_PACKED_HEADER_BYTES = 20;
+const size_t MARKET_PACKED_MAX_BYTES = 30 * 1024;
+unsigned long lastMarketPollMs = 0;
+uint64_t lastMarketFrameVersion = 0;
+String lastMarketFrameSession;
 
 String musicTitle, musicArtist, musicAlbum;
 bool musicPlaying = false;
@@ -218,6 +242,62 @@ void saveBrightness() {
   if (!f) return;
   f.println(brightness);
   f.close();
+}
+
+bool validAutoCycleSeconds(int seconds) {
+  return seconds == 5 || seconds == 10 || seconds == 30 || seconds == 60 || seconds == 120;
+}
+
+uint8_t selectedAutoPageCount() {
+  uint8_t count = 0;
+  for (uint8_t mode = MODE_CLAUDE; mode <= MODE_MARKET; ++mode) {
+    if (autoPageMask & (1U << mode)) ++count;
+  }
+  return count;
+}
+
+DisplayMode autoPageAt(uint8_t selectedIndex) {
+  uint8_t found = 0;
+  for (uint8_t mode = MODE_CLAUDE; mode <= MODE_MARKET; ++mode) {
+    if (!(autoPageMask & (1U << mode))) continue;
+    if (found++ == selectedIndex) return (DisplayMode)mode;
+  }
+  return MODE_CODEX;
+}
+
+void loadAutoCycle() {
+  if (!LittleFS.exists(AUTO_CYCLE_FILE)) return;
+  File f = LittleFS.open(AUTO_CYCLE_FILE, "r");
+  if (!f) return;
+  const int mask = f.readStringUntil('\n').toInt();
+  const int seconds = f.readStringUntil('\n').toInt();
+  f.close();
+  const uint8_t allowedMask = ((1U << (MODE_MARKET + 1)) - 1U) & ~1U;
+  if ((mask & allowedMask) != 0) autoPageMask = (uint8_t)(mask & allowedMask);
+  if (validAutoCycleSeconds(seconds)) autoCycleSeconds = seconds;
+}
+
+void saveAutoCycle() {
+  File f = LittleFS.open(AUTO_CYCLE_FILE, "w");
+  if (!f) return;
+  f.println(autoPageMask);
+  f.println(autoCycleSeconds);
+  f.close();
+}
+
+void resetAutoCyclePosition() {
+  autoPageIndex = 0;
+  autoPageStartedMs = millis();
+}
+
+void advanceAutoCycleIfNeeded(unsigned long nowMs) {
+  if (displayMode != MODE_AUTO) return;
+  const uint8_t count = selectedAutoPageCount();
+  if (count == 0) return;
+  if (nowMs - autoPageStartedMs >= (unsigned long)autoCycleSeconds * 1000UL) {
+    autoPageIndex = (autoPageIndex + 1) % count;
+    autoPageStartedMs = nowMs;
+  }
 }
 
 // ---------- persistence for the bridge host ----------
@@ -1233,6 +1313,174 @@ void drawStockScreen() {
   }
 }
 
+// ---------- full-screen K-line frame ----------
+
+bool readMarketExact(WiFiClient *stream, uint8_t *dst, size_t length,
+                     unsigned long timeoutMs) {
+  size_t received = 0;
+  unsigned long deadline = millis() + timeoutMs;
+  while (received < length) {
+    int available = stream->available();
+    if (available > 0) {
+      size_t want = min((size_t)available, length - received);
+      int got = stream->read(dst + received, want);
+      if (got > 0) {
+        received += (size_t)got;
+        continue;
+      }
+    }
+    if ((long)(millis() - deadline) >= 0) return false;
+    delay(1);
+    yield();
+  }
+  return true;
+}
+
+uint32_t marketCrc32(const uint8_t *data, size_t length) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < length; ++i) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      crc = (crc >> 1) ^ ((crc & 1U) ? 0xEDB88320U : 0U);
+    }
+  }
+  return ~crc;
+}
+
+uint64_t marketReadU64BE(const uint8_t *data) {
+  uint64_t value = 0;
+  for (int i = 0; i < 8; ++i) value = (value << 8) | data[i];
+  return value;
+}
+
+uint32_t marketReadU32BE(const uint8_t *data) {
+  return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+         ((uint32_t)data[2] << 8) | data[3];
+}
+
+// Validate every byte and the decoded pixel count before the TFT is touched.
+// A short/corrupt/oversized download therefore leaves the prior page intact.
+bool validateMarketFrame(const uint8_t *frame, size_t frameBytes,
+                         uint64_t expectedVersion, uint64_t &versionOut) {
+  if (frameBytes < MARKET_PACKED_HEADER_BYTES || memcmp(frame, "MKT1", 4) != 0) return false;
+  const uint16_t width = ((uint16_t)frame[12] << 8) | frame[13];
+  const uint16_t height = ((uint16_t)frame[14] << 8) | frame[15];
+  if (width != SCREEN_W || height != SCREEN_H) return false;
+  const uint64_t version = marketReadU64BE(frame + 4);
+  if (version < expectedVersion || version <= lastMarketFrameVersion) return false;
+  const uint8_t *payload = frame + MARKET_PACKED_HEADER_BYTES;
+  const size_t payloadBytes = frameBytes - MARKET_PACKED_HEADER_BYTES;
+  if (marketCrc32(payload, payloadBytes) != marketReadU32BE(frame + 16)) return false;
+
+  size_t cursor = 0, pixels = 0;
+  while (cursor < payloadBytes) {
+    const uint8_t control = payload[cursor++];
+    const size_t count = (control & 0x7F) + 1;
+    const size_t encoded = (control & 0x80) ? 2 : count * 2;
+    if (cursor + encoded > payloadBytes || pixels + count > SCREEN_W * SCREEN_H) return false;
+    cursor += encoded;
+    pixels += count;
+  }
+  if (pixels != SCREEN_W * SCREEN_H) return false;
+  versionOut = version;
+  return true;
+}
+
+void drawMarketFrame(const uint8_t *frame, size_t frameBytes) {
+  const uint8_t *payload = frame + MARKET_PACKED_HEADER_BYTES;
+  const size_t payloadBytes = frameBytes - MARKET_PACKED_HEADER_BYTES;
+  uint8_t *rowBytes = reinterpret_cast<uint8_t *>(rowBuf);
+  size_t cursor = 0, rowPixels = 0;
+  int y = 0;
+  tft.startWrite();
+  while (cursor < payloadBytes) {
+    const uint8_t control = payload[cursor++];
+    size_t count = (control & 0x7F) + 1;
+    const bool repeated = control & 0x80;
+    uint8_t high = 0, low = 0;
+    if (repeated) { high = payload[cursor++]; low = payload[cursor++]; }
+    while (count-- > 0) {
+      rowBytes[rowPixels * 2] = repeated ? high : payload[cursor++];
+      rowBytes[rowPixels * 2 + 1] = repeated ? low : payload[cursor++];
+      if (++rowPixels == SCREEN_W) {
+        tft.pushImage(0, y++, SCREEN_W, 1, rowBuf);
+        rowPixels = 0;
+        yield();
+      }
+    }
+  }
+  tft.endWrite();
+}
+
+bool fetchMarketFrame(uint64_t expectedVersion, size_t advertisedBytes) {
+  if (advertisedBytes < MARKET_PACKED_HEADER_BYTES ||
+      advertisedBytes > MARKET_PACKED_MAX_BYTES) return false;
+  // Leave enough contiguous heap for HTTP/TCP and the rest of the firmware.
+  if (ESP.getMaxFreeBlockSize() < advertisedBytes + 6144) {
+    Serial.printf("[market] insufficient heap frame=%u maxblock=%u\n",
+                  (unsigned)advertisedBytes, ESP.getMaxFreeBlockSize());
+    return false;
+  }
+  uint8_t *frame = (uint8_t *)malloc(advertisedBytes);
+  if (!frame) return false;
+
+  WiFiClient client;
+  client.setTimeout(MARKET_READ_TIMEOUT_MS);
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/market/frame.rle";
+  http.setTimeout(MARKET_HTTP_TIMEOUT_MS);
+  bool ok = false;
+  if (http.begin(client, url)) {
+    const int code = http.GET();
+    const int actualBytes = http.getSize();
+    if (code == HTTP_CODE_OK && actualBytes == (int)advertisedBytes) {
+      WiFiClient *stream = http.getStreamPtr();
+      if (readMarketExact(stream, frame, advertisedBytes, MARKET_TOTAL_TIMEOUT_MS)) {
+        uint64_t version = 0;
+        if (validateMarketFrame(frame, advertisedBytes, expectedVersion, version)) {
+          drawMarketFrame(frame, advertisedBytes);
+          lastMarketFrameVersion = version;
+          ok = true;
+          Serial.printf("[market] applied version=%llu bytes=%u heap=%u\n",
+                        (unsigned long long)version, (unsigned)advertisedBytes,
+                        ESP.getFreeHeap());
+        }
+      }
+    }
+    http.end();
+  }
+  free(frame);
+  if (!ok) Serial.println("[market] frame rejected; keeping previous screen");
+  return ok;
+}
+
+void pollMarket() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/market/version";
+  http.setTimeout(MARKET_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return;
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return; }
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, http.getString());
+  http.end();
+  if (err) return;
+  const char *session = doc["session"] | "";
+  if (session[0] != '\0' && lastMarketFrameSession != session) {
+    lastMarketFrameSession = session;
+    lastMarketFrameVersion = 0;
+  }
+  const uint64_t version = doc["version"] | (uint64_t)0;
+  const char *codec = doc["codec"] | "";
+  const size_t packedBytes = doc["packed_bytes"] | (size_t)0;
+  if (version > lastMarketFrameVersion &&
+      strcmp(codec, "rgb565-packbits-v1") == 0) {
+    fetchMarketFrame(version, packedBytes);
+  }
+}
+
 // ---------- WiFi / bridge polling ----------
 
 WiFiManager wifiManager; // global: the config portal now runs non-blocking in loop()
@@ -1306,17 +1554,30 @@ bool parseStatusJson(const String &payload) {
   return true;
 }
 
-// The mode actually rendered. In AUTO: a pending approval prompt wins (stay on
-// the pet so its border can flash red at you), otherwise audio promotes to the
-// music page.
+// The mode actually rendered. AUTO selects exactly one configured carousel
+// page; the fixed-page modes keep their original behavior.
 DisplayMode effectiveMode() {
   if (displayMode == MODE_AUTO) {
-    if (claudeStatus.needsInput || codexStatus.needsInput) return MODE_AUTO;
-    // music page needs HTTP for cover/text bitmaps, so don't auto-promote
-    // when running wired-only (no WiFi)
-    if (statusMusicPlaying && WiFi.status() == WL_CONNECTED) return MODE_MUSIC;
+    const uint8_t count = selectedAutoPageCount();
+    if (count == 0) return MODE_CODEX;
+    if (autoPageIndex >= count) autoPageIndex = 0;
+    return autoPageAt(autoPageIndex);
   }
   return displayMode;
+}
+
+bool selectEffectivePet(DisplayMode eff) {
+  if (eff == MODE_CLAUDE) {
+    const bool changed = currentApp != APP_CLAUDE;
+    currentApp = APP_CLAUDE;
+    return changed;
+  }
+  if (eff == MODE_CODEX) {
+    const bool changed = currentApp != APP_CODEX;
+    currentApp = APP_CODEX;
+    return changed;
+  }
+  return updateActiveApp();
 }
 
 void pollBridge() {
@@ -1353,10 +1614,10 @@ void pollBridge() {
   }
   http.end();
   DisplayMode eff = effectiveMode();
-  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
+  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_MARKET) {
     // Only a real app switch clears the screen; a plain data refresh paints
     // in place so the poll doesn't flash the whole display.
-    if (updateActiveApp()) drawActiveApp();
+    if (selectEffectivePet(eff)) drawActiveApp();
     else refreshActiveApp();
   }
 }
@@ -1380,6 +1641,7 @@ bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 
 void showMainUiIfNeeded() {
   if (mainUiShown) return;
   mainUiShown = true;
+  if (displayMode == MODE_AUTO) resetAutoCyclePosition();
   drawStaticChrome();
   updateActiveApp();
   drawActiveApp();
@@ -1398,8 +1660,8 @@ void handleSerialFrame(char *line) {
       everPolled = true;
       showMainUiIfNeeded();
       DisplayMode eff = effectiveMode();
-      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK) {
-        if (updateActiveApp()) drawActiveApp();
+      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_MARKET) {
+        if (selectEffectivePet(eff)) drawActiveApp();
         else refreshActiveApp();
       }
     }
@@ -1424,12 +1686,13 @@ void handleSerialFrame(char *line) {
     const char *mode = doc["display"] | (const char *)nullptr;
     if (mode) {
       String m(mode);
-      if (m == "auto") displayMode = MODE_AUTO;
+      if (m == "auto") { displayMode = MODE_AUTO; resetAutoCyclePosition(); lastEffectiveMode = MODE_AUTO; }
       else if (m == "claude") displayMode = MODE_CLAUDE;
       else if (m == "codex") displayMode = MODE_CODEX;
       else if (m == "net") displayMode = MODE_NET;
       else if (m == "music") displayMode = MODE_MUSIC;
       else if (m == "stock") displayMode = MODE_STOCK;
+      else if (m == "market") displayMode = MODE_MARKET;
       // the effectiveMode transition handler in loop() repaints the chrome
     }
     return;
@@ -1553,6 +1816,7 @@ const char *displayModeName(DisplayMode m) {
   if (m == MODE_NET) return "net";
   if (m == MODE_MUSIC) return "music";
   if (m == MODE_STOCK) return "stock";
+  if (m == MODE_MARKET) return "market";
   return "auto";
 }
 
@@ -1570,6 +1834,11 @@ void handleApiInfo() {
   doc["brightness"] = brightness;
   doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
   doc["fw"] = FW_VERSION;
+  doc["auto_seconds"] = autoCycleSeconds;
+  JsonArray autoPages = doc["auto_pages"].to<JsonArray>();
+  for (uint8_t mode = MODE_CLAUDE; mode <= MODE_MARKET; ++mode) {
+    if (autoPageMask & (1U << mode)) autoPages.add(displayModeName((DisplayMode)mode));
+  }
   JsonObject c = doc["claude"].to<JsonObject>();
   c["status"] = claudeStatus.status;
   c["custom_sprite"] = claudeCustom;
@@ -1587,18 +1856,25 @@ void handleApiInfo() {
 
 void handleApiDisplay() {
   String mode = webServer.arg("mode");
-  if (mode == "auto") displayMode = MODE_AUTO;
+  if (mode == "auto") {
+    displayMode = MODE_AUTO;
+    resetAutoCyclePosition();
+    lastEffectiveMode = MODE_AUTO; // effective carousel pages never equal AUTO
+  }
   else if (mode == "claude") displayMode = MODE_CLAUDE;
   else if (mode == "codex") displayMode = MODE_CODEX;
   else if (mode == "net") displayMode = MODE_NET;
   else if (mode == "music") displayMode = MODE_MUSIC;
   else if (mode == "stock") displayMode = MODE_STOCK;
+  else if (mode == "market") displayMode = MODE_MARKET;
   else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock");
+    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock|market");
     return;
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
-  if (displayMode == MODE_NET) {
+  if (displayMode == MODE_AUTO) {
+    // loop() performs the first selected page's normal transition atomically.
+  } else if (displayMode == MODE_NET) {
     netChromeDrawn = false;
     lastNetPollMs = 0; // poll + draw on the next loop tick
   } else if (displayMode == MODE_MUSIC) {
@@ -1607,10 +1883,50 @@ void handleApiDisplay() {
   } else if (displayMode == MODE_STOCK) {
     stockChromeDrawn = false;
     lastStockPollMs = 0; // poll + draw on the next loop tick
+  } else if (displayMode == MODE_MARKET) {
+    lastMarketPollMs = 0;
+    lastMarketFrameVersion = 0; // force a redraw when returning from another page
   } else {
     updateActiveApp();
     drawActiveApp(); // unconditional: also repaints over a previous net chart
   }
+  webServer.send(200, "text/plain", "ok");
+}
+
+void handleApiAutoCycle() {
+  String pages = webServer.arg("pages");
+  const int seconds = webServer.arg("seconds").toInt();
+  uint8_t mask = 0;
+  while (pages.length() > 0) {
+    int comma = pages.indexOf(',');
+    String page = comma >= 0 ? pages.substring(0, comma) : pages;
+    pages = comma >= 0 ? pages.substring(comma + 1) : "";
+    page.trim();
+    if (page == "claude") mask |= 1U << MODE_CLAUDE;
+    else if (page == "codex") mask |= 1U << MODE_CODEX;
+    else if (page == "net") mask |= 1U << MODE_NET;
+    else if (page == "music") mask |= 1U << MODE_MUSIC;
+    else if (page == "stock") mask |= 1U << MODE_STOCK;
+    else if (page == "market") mask |= 1U << MODE_MARKET;
+    else if (page.length() > 0) {
+      webServer.send(400, "text/plain", "unknown auto page: " + page);
+      return;
+    }
+  }
+  if (mask == 0) {
+    webServer.send(400, "text/plain", "select at least one auto page");
+    return;
+  }
+  if (!validAutoCycleSeconds(seconds)) {
+    webServer.send(400, "text/plain", "seconds must be 5|10|30|60|120");
+    return;
+  }
+  autoPageMask = mask;
+  autoCycleSeconds = seconds;
+  resetAutoCyclePosition();
+  saveAutoCycle();
+  if (displayMode == MODE_AUTO) lastEffectiveMode = MODE_AUTO;
+  Serial.printf("[api] auto pages mask=%u seconds=%u\n", autoPageMask, autoCycleSeconds);
   webServer.send(200, "text/plain", "ok");
 }
 
@@ -1925,6 +2241,7 @@ void setupWebServer() {
   webServer.on("/reset-wifi", HTTP_POST, handleResetWifi);
   webServer.on("/api/info", HTTP_GET, handleApiInfo);
   webServer.on("/api/display", HTTP_POST, handleApiDisplay);
+  webServer.on("/api/auto", HTTP_POST, handleApiAutoCycle);
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
   webServer.on("/api/brightness", HTTP_POST, handleApiBrightness);
   webServer.on("/sprite/claude/reset", HTTP_POST, []() { handleSpriteReset(APP_CLAUDE); });
@@ -1949,6 +2266,7 @@ void setup() {
   LittleFS.begin();
   loadBridgeHost();
   loadBrightness();
+  loadAutoCycle();
   loadCustomSpriteState();
 
   tft.init();
@@ -1996,6 +2314,7 @@ void loop() {
   if (!mainUiShown) return; // config-portal screen is up, nothing to animate
 
   unsigned long nowMs = millis();
+  advanceAutoCycleIfNeeded(nowMs);
 
   // Effective mode may differ from the configured one (AUTO -> music while
   // audio plays). On a transition, reset the incoming mode's chrome so it
@@ -2012,8 +2331,11 @@ void loop() {
     } else if (eff == MODE_STOCK) {
       stockChromeDrawn = false;
       lastStockPollMs = 0;
+    } else if (eff == MODE_MARKET) {
+      lastMarketPollMs = 0;
+      lastMarketFrameVersion = 0;
     } else {
-      updateActiveApp();
+      selectEffectivePet(eff);
       drawActiveApp();
     }
   }
@@ -2042,6 +2364,11 @@ void loop() {
       if (!wiredActive()) pollStock();
     }
     if (!stockChromeDrawn || stockDirty) drawStockScreen();
+  } else if (eff == MODE_MARKET) {
+    if (nowMs - lastMarketPollMs >= MARKET_POLL_INTERVAL_MS) {
+      lastMarketPollMs = nowMs;
+      pollMarket();
+    }
   } else {
     // sprite walk-cycle animation (only advances while that app is showing)
     if (nowMs - lastAnimMs >= ANIM_INTERVAL_MS) {
@@ -2081,7 +2408,7 @@ void loop() {
     }
 
     // alternate which app is shown when neither/both are uniquely working
-    if (updateActiveApp()) {
+    if (displayMode != MODE_AUTO && updateActiveApp()) {
       drawActiveApp();
     }
   }

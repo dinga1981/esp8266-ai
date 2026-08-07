@@ -1,7 +1,7 @@
 #pragma once
 
 // ---- Firmware version (shown on the first-time WiFi setup screen & /api/info) ----
-#define FW_VERSION "0.4.9"
+#define FW_VERSION "0.5.1"
 
 // ---- Bridge polling ----
 #define BRIDGE_DEFAULT_PORT 8765
@@ -17,6 +17,10 @@
 #define BRIGHTNESS_FILE "/brightness.txt"
 #define BRIGHTNESS_DEFAULT 100
 #define BRIGHTNESS_PWM_FREQ 2000 // Hz; high enough to avoid visible flicker when dim
+
+// ---- Configurable automatic page carousel ----
+#define AUTO_CYCLE_FILE "/auto_cycle.txt"
+#define AUTO_CYCLE_DEFAULT_SECONDS 10
 
 // ---- Display layout (240x240 ST7789) ----
 #define SCREEN_W 240

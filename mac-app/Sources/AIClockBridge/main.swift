@@ -45,6 +45,8 @@ service.musicPlayingProvider = { nowPlaying.snapshot.playing }
 
 let stockMonitor = StockMonitor()
 stockMonitor.start()
+let marketMonitor = MarketMonitor()
+marketMonitor.start()
 
 // Wired fallback: if the clock is plugged in over USB, push status/net down
 // the serial line (works around AP client isolation; no WiFi setup needed).
@@ -60,10 +62,14 @@ let server = HTTPServer(port: port, routes: [
     },
     "/music": { nowPlaying.jsonData() },
     "/stock": { stockMonitor.jsonData() },
+    "/market": { marketMonitor.jsonData() },
+    "/market/version": { marketMonitor.frameVersionJSON },
 ], binaryRoutes: [
     "/music/cover.raw": { nowPlaying.coverRGB565 },
     "/music/text.raw": { nowPlaying.textRGB565 },
     "/stock/names.raw": { stockMonitor.namesRGB565() },
+    "/market/frame.rle": { marketMonitor.packedFrameEnvelope },
+    "/market/frame.raw": { marketMonitor.frameEnvelope },
 ], postRoutes: [
     // Claude Code / Codex hooks push lifecycle events here (see README §7):
     // curl -d '{"agent":"claude","event":"PreToolUse"}' http://127.0.0.1:8765/event
@@ -103,7 +109,8 @@ do {
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let menuBar = MenuBarController(service: service, usage: usage, netMonitor: netMonitor,
-                                nowPlaying: nowPlaying, stockMonitor: stockMonitor, port: port)
+                                nowPlaying: nowPlaying, stockMonitor: stockMonitor,
+                                market: marketMonitor, port: port)
 _ = menuBar // retain
 usage.startAutoRefresh()
 app.run()

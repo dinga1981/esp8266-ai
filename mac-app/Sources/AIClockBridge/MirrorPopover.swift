@@ -86,6 +86,8 @@ final class MirrorView: NSView {
     var netMem = -1
     var stockMode = false
     var stockRows: [StockMonitor.Row] = []
+    var marketMode = false
+    var marketFrame: CGImage?
     var netHeaderDL = "0B"
     var netHeaderUL = "0B"
     private static let netCols = 224 // NET_CHART_W
@@ -148,6 +150,18 @@ final class MirrorView: NSView {
         }
         if stockMode {
             drawStockScene()
+            ctx.restoreGState()
+            return
+        }
+        if marketMode {
+            if let marketFrame {
+                ctx.saveGState()
+                ctx.interpolationQuality = .none
+                ctx.translateBy(x: 0, y: 240)
+                ctx.scaleBy(x: 1, y: -1)
+                ctx.draw(marketFrame, in: CGRect(x: 0, y: 0, width: 240, height: 240))
+                ctx.restoreGState()
+            }
             ctx.restoreGState()
             return
         }
@@ -388,7 +402,7 @@ final class MirrorView: NSView {
         if stockRows.isEmpty {
             let style = NSMutableParagraphStyle()
             style.alignment = .center
-            ("未配置自选股\n右键菜单 → 设置自选股…" as NSString).draw(
+            ("未配置自选行情\n右键菜单 → 设置自选行情…" as NSString).draw(
                 in: NSRect(x: 0, y: 104, width: 240, height: 40), withAttributes: [
                     .font: NSFont.systemFont(ofSize: 11), .foregroundColor: grey,
                     .paragraphStyle: style,
@@ -438,9 +452,10 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let netMonitor: NetSpeedMonitor
     private let nowPlaying: NowPlayingMonitor
     private let stockMonitor: StockMonitor
+    private let market: MarketMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
-    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐", "股票"],
+    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐", "报价", "K线"],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
     private let brightnessSlider = NSSlider(value: 100, minValue: 0, maxValue: 100,
@@ -459,11 +474,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var fetchingSlot: String?
 
     init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor,
-         stockMonitor: StockMonitor) {
+         stockMonitor: StockMonitor, market: MarketMonitor) {
         self.service = service
         self.netMonitor = netMonitor
         self.nowPlaying = nowPlaying
         self.stockMonitor = stockMonitor
+        self.market = market
         super.init()
         popover.behavior = .transient
         popover.delegate = self
@@ -597,11 +613,13 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.ensureSprite(info)
                 self.syncBrightness(info)
                 let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3,
-                               "music": 4, "stock": 5][info.mode] ?? 0
+                               "music": 4, "stock": 5, "market": 6][info.mode] ?? 0
                 self.modeControl.selectedSegment = modeIdx
                 let modeText = info.mode == "auto" ? "自动切换"
                     : info.mode == "net" ? "网速曲线"
-                    : info.mode == "music" ? "音乐播放" : "固定显示"
+                    : info.mode == "music" ? "音乐播放"
+                    : info.mode == "stock" ? "四行报价"
+                    : info.mode == "market" ? "K线行情" : "固定显示"
                 self.statusLabel.stringValue = "\(info.ip) · \(modeText) · 数据 \(info.bridge)"
             case .failure:
                 self.mirror.deviceOK = false
@@ -629,6 +647,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         mirror.netMode = info.effective == "net"
         mirror.musicMode = info.effective == "music"
         mirror.stockMode = info.effective == "stock"
+        mirror.marketMode = info.effective == "market"
+        if mirror.marketMode {
+            mirror.marketFrame = decodeCover(market.frameRGB565, w: 240, h: 240)
+            mirror.needsDisplay = true
+            return
+        }
         if mirror.stockMode {
             mirror.stockRows = stockMonitor.snapshot
             mirror.needsDisplay = true
@@ -741,7 +765,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func modeChanged() {
-        let mode = ["auto", "claude", "codex", "net", "music", "stock"][max(0, modeControl.selectedSegment)]
+        let mode = ["auto", "claude", "codex", "net", "music", "stock", "market"][max(0, modeControl.selectedSegment)]
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }

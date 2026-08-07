@@ -1,0 +1,1477 @@
+import AppKit
+import Foundation
+
+enum MarketInterval: String, CaseIterable {
+    case oneMinute = "1m"
+    case fiveMinutes = "5m"
+    case oneHour = "60m"
+
+    var seconds: Int {
+        switch self {
+        case .oneMinute: return 60
+        case .fiveMinutes: return 300
+        case .oneHour: return 3600
+        }
+    }
+}
+
+typealias BTCInterval = MarketInterval
+
+/// Compact RGB565 transport for the 240x240 market frame. Control bytes use
+/// a PackBits-style format: bit 7 means a repeated pixel, otherwise a literal
+/// pixel sequence; the lower seven bits store count - 1 (1...128 pixels).
+/// The envelope is: "MKT1", UInt64 version, UInt16 width, UInt16 height,
+/// UInt32 payload CRC, followed by the packed pixel stream. All multibyte
+/// values and pixels stay in the big-endian wire order used by the raw route.
+enum MarketFrameCodec {
+    static let width = 240
+    static let height = 240
+    static let headerBytes = 20
+    private static let magic: [UInt8] = [0x4D, 0x4B, 0x54, 0x31] // MKT1
+
+    static func packRGB565(_ frame: Data) -> Data {
+        guard frame.count == width * height * 2 else { return Data() }
+        let bytes = [UInt8](frame)
+        let pixelCount = width * height
+        var packed = Data(capacity: frame.count / 4)
+        var pixel = 0
+
+        func pixelsEqual(_ lhs: Int, _ rhs: Int) -> Bool {
+            bytes[lhs * 2] == bytes[rhs * 2] && bytes[lhs * 2 + 1] == bytes[rhs * 2 + 1]
+        }
+
+        while pixel < pixelCount {
+            var repeated = 1
+            while repeated < 128, pixel + repeated < pixelCount,
+                  pixelsEqual(pixel, pixel + repeated) {
+                repeated += 1
+            }
+            if repeated >= 2 {
+                packed.append(0x80 | UInt8(repeated - 1))
+                packed.append(bytes[pixel * 2])
+                packed.append(bytes[pixel * 2 + 1])
+                pixel += repeated
+                continue
+            }
+
+            let literalStart = pixel
+            pixel += 1
+            while pixel - literalStart < 128, pixel < pixelCount {
+                var nextRepeated = 1
+                while nextRepeated < 128, pixel + nextRepeated < pixelCount,
+                      pixelsEqual(pixel, pixel + nextRepeated) {
+                    nextRepeated += 1
+                }
+                if nextRepeated >= 2 { break }
+                pixel += 1
+            }
+            let literalCount = pixel - literalStart
+            packed.append(UInt8(literalCount - 1))
+            for byte in (literalStart * 2)..<(pixel * 2) { packed.append(bytes[byte]) }
+        }
+        return packed
+    }
+
+    static func envelope(packed: Data, version: UInt64) -> Data {
+        guard !packed.isEmpty else { return Data() }
+        var out = Data(capacity: headerBytes + packed.count)
+        out.append(contentsOf: magic)
+        for shift in stride(from: 56, through: 0, by: -8) {
+            out.append(UInt8((version >> UInt64(shift)) & 0xFF))
+        }
+        out.append(UInt8(width >> 8)); out.append(UInt8(width & 0xFF))
+        out.append(UInt8(height >> 8)); out.append(UInt8(height & 0xFF))
+        let crc = crc32(packed)
+        out.append(UInt8((crc >> 24) & 0xFF)); out.append(UInt8((crc >> 16) & 0xFF))
+        out.append(UInt8((crc >> 8) & 0xFF)); out.append(UInt8(crc & 0xFF))
+        out.append(packed)
+        return out
+    }
+
+    static func crc32(_ data: Data) -> UInt32 {
+        var crc = UInt32.max
+        for byte in data {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                crc = (crc >> 1) ^ ((crc & 1) == 0 ? 0 : 0xEDB88320)
+            }
+        }
+        return ~crc
+    }
+}
+
+/// How often the bridge fetches the selected quote and rotates to the next
+/// favorite. The ESP keeps polling the frame version at its own one-second
+/// cadence, so changing this value never requires a firmware update.
+enum MarketRefreshInterval: String, CaseIterable {
+    case fiveSeconds = "5"
+    case tenSeconds = "10"
+    case thirtySeconds = "30"
+    case oneMinute = "60"
+    case twoMinutes = "120"
+
+    var seconds: TimeInterval { Double(rawValue)! }
+
+    var title: String {
+        switch self {
+        case .fiveSeconds: return "5 秒"
+        case .tenSeconds: return "10 秒"
+        case .thirtySeconds: return "30 秒"
+        case .oneMinute: return "60 秒"
+        case .twoMinutes: return "120 秒"
+        }
+    }
+}
+
+enum MarketRegion: String, Codable {
+    case crypto, cn, hk, us, kr, domesticFutures, globalFutures, forex
+
+    var currency: String {
+        switch self {
+        case .crypto, .us, .globalFutures: return "USD"
+        case .cn, .domesticFutures: return "CNY"
+        case .hk: return "HKD"
+        case .kr: return "KRW"
+        case .forex: return ""
+        }
+    }
+
+    var timeZone: TimeZone {
+        switch self {
+        case .crypto: return TimeZone(secondsFromGMT: 0)!
+        case .cn, .hk, .domesticFutures: return TimeZone(identifier: "Asia/Shanghai")!
+        case .us: return TimeZone(identifier: "America/New_York")!
+        case .kr: return TimeZone(identifier: "Asia/Seoul")!
+        case .globalFutures, .forex: return TimeZone(secondsFromGMT: 0)!
+        }
+    }
+}
+
+struct MarketInstrument: Equatable, Codable {
+    let id: String
+    let region: MarketRegion
+    let providerCode: String
+    let symbol: String
+    let name: String
+    let currency: String
+    let isIndex: Bool
+
+    var menuTitle: String { "\(name)  \(symbol)" }
+
+    static let btc = MarketInstrument(id: "btc-usd", region: .crypto, providerCode: "BTC-USD",
+                                      symbol: "BTC/USD", name: "BTC", currency: "USD", isIndex: false)
+    static let eth = MarketInstrument(id: "eth-usd", region: .crypto, providerCode: "ETH-USD",
+                                      symbol: "ETH/USD", name: "ETH", currency: "USD", isIndex: false)
+    static let aapl = MarketInstrument(id: "us-AAPL", region: .us, providerCode: "usAAPL",
+                                       symbol: "AAPL", name: "Apple", currency: "USD", isIndex: false)
+    static let nvda = MarketInstrument(id: "us-NVDA", region: .us, providerCode: "usNVDA",
+                                       symbol: "NVDA", name: "NVIDIA", currency: "USD", isIndex: false)
+    static let tsla = MarketInstrument(id: "us-TSLA", region: .us, providerCode: "usTSLA",
+                                       symbol: "TSLA", name: "Tesla", currency: "USD", isIndex: false)
+    static let londonGold = MarketInstrument(id: "fx-XAUUSD", region: .globalFutures,
+                                              providerCode: "XAU", symbol: "XAU/USD",
+                                              name: "伦敦金", currency: "USD", isIndex: false)
+    static let shfeGold = MarketInstrument(id: "sf-AU0", region: .domesticFutures,
+                                            providerCode: "AU0", symbol: "AU0",
+                                            name: "沪金主连", currency: "CNY", isIndex: false)
+    static let usdCnh = MarketInstrument(id: "fx-USDCNH", region: .forex,
+                                          providerCode: "fx_susdcnh", symbol: "USD/CNH",
+                                          name: "离岸人民币", currency: "CNH", isIndex: false)
+    static let dxy = MarketInstrument(id: "fx-DXY", region: .forex,
+                                       providerCode: "100.UDI", symbol: "DXY",
+                                       name: "美元指数", currency: "", isIndex: true)
+
+    static let presets: [MarketInstrument] = [
+        btc,
+        eth,
+        MarketInstrument(id: "cn-sh000001", region: .cn, providerCode: "sh000001", symbol: "000001", name: "上证指数", currency: "CNY", isIndex: true),
+        MarketInstrument(id: "cn-sz399001", region: .cn, providerCode: "sz399001", symbol: "399001", name: "深证成指", currency: "CNY", isIndex: true),
+        MarketInstrument(id: "cn-sz399006", region: .cn, providerCode: "sz399006", symbol: "399006", name: "创业板指", currency: "CNY", isIndex: true),
+        MarketInstrument(id: "cn-sh000300", region: .cn, providerCode: "sh000300", symbol: "000300", name: "沪深300", currency: "CNY", isIndex: true),
+        MarketInstrument(id: "hk-HSI", region: .hk, providerCode: "hkHSI", symbol: "HSI", name: "恒生指数", currency: "HKD", isIndex: true),
+        MarketInstrument(id: "hk-HSCEI", region: .hk, providerCode: "hkHSCEI", symbol: "HSCEI", name: "国企指数", currency: "HKD", isIndex: true),
+        MarketInstrument(id: "hk-HSTECH", region: .hk, providerCode: "hkHSTECH", symbol: "HSTECH", name: "恒生科技", currency: "HKD", isIndex: true),
+        MarketInstrument(id: "us-NDX", region: .us, providerCode: "usNDX", symbol: "NDX", name: "纳斯达克100", currency: "USD", isIndex: true),
+        MarketInstrument(id: "us-INX", region: .us, providerCode: "usINX", symbol: "SPX", name: "标普500", currency: "USD", isIndex: true),
+        MarketInstrument(id: "us-DJI", region: .us, providerCode: "usDJI", symbol: "DJI", name: "道琼斯", currency: "USD", isIndex: true),
+        MarketInstrument(id: "us-IXIC", region: .us, providerCode: "usIXIC", symbol: "IXIC", name: "纳斯达克综合", currency: "USD", isIndex: true),
+        aapl,
+        nvda,
+        tsla,
+        londonGold, shfeGold, usdCnh, dxy,
+        MarketInstrument(id: "kr-KOSPI", region: .kr, providerCode: "KOSPI", symbol: "KOSPI", name: "韩国综合", currency: "KRW", isIndex: true),
+        MarketInstrument(id: "kr-KOSDAQ", region: .kr, providerCode: "KOSDAQ", symbol: "KOSDAQ", name: "韩国科创", currency: "KRW", isIndex: true),
+        MarketInstrument(id: "kr-005930", region: .kr, providerCode: "005930", symbol: "005930", name: "三星电子", currency: "KRW", isIndex: false),
+    ]
+
+    /// The initial rotation list. It intentionally contains the most useful
+    /// cross-market glance set while leaving room for up to 15 user favorites.
+    static let defaultFavorites: [MarketInstrument] = [
+        btc, eth,
+        MarketInstrument(id: "cn-sh000001", region: .cn, providerCode: "sh000001", symbol: "000001", name: "上证指数", currency: "CNY", isIndex: true),
+        MarketInstrument(id: "hk-HSI", region: .hk, providerCode: "hkHSI", symbol: "HSI", name: "恒生指数", currency: "HKD", isIndex: true),
+        MarketInstrument(id: "us-NDX", region: .us, providerCode: "usNDX", symbol: "NDX", name: "纳斯达克100", currency: "USD", isIndex: true),
+        MarketInstrument(id: "us-INX", region: .us, providerCode: "usINX", symbol: "SPX", name: "标普500", currency: "USD", isIndex: true),
+        aapl, nvda,
+        MarketInstrument(id: "kr-KOSPI", region: .kr, providerCode: "KOSPI", symbol: "KOSPI", name: "韩国综合", currency: "KRW", isIndex: true),
+        londonGold, shfeGold, usdCnh, dxy,
+    ]
+
+    static func preset(id: String) -> MarketInstrument? {
+        presets.first { $0.id == id }
+    }
+
+    /// Resolves a code or a small set of stable aliases without requiring an
+    /// account. Prefixes remove the ambiguity between a Korean six-digit code
+    /// and an A-share code: sh/sz/bj/hk/us/kr.
+    static func parse(_ raw: String) -> MarketInstrument? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let dash = trimmed.firstIndex(of: "-") {
+            let family = trimmed[..<dash].uppercased()
+            let tail = String(trimmed[trimmed.index(after: dash)...])
+            switch family {
+            case "CN": return parse(tail)
+            case "HK": return parse("HK\(tail)")
+            case "US": return parse("US\(tail)")
+            case "KR": return parse("KR\(tail)")
+            default: break
+            }
+        }
+        let value = trimmed
+            .replacingOccurrences(of: ":", with: "")
+            .uppercased()
+        guard !value.isEmpty else { return nil }
+        let aliases: [String: String] = [
+            "BTC": "btc-usd", "BTCUSD": "btc-usd", "BTC/US": "btc-usd", "BTC-USD": "btc-usd",
+            "ETH": "eth-usd", "ETHUSD": "eth-usd", "ETH/US": "eth-usd", "ETH-USD": "eth-usd",
+            "上证": "cn-sh000001", "上证指数": "cn-sh000001", "000001.SH": "cn-sh000001",
+            "深证": "cn-sz399001", "深证成指": "cn-sz399001", "创业板": "cn-sz399006",
+            "沪深300": "cn-sh000300", "恒生": "hk-HSI", "恒生指数": "hk-HSI",
+            "恒生科技": "hk-HSTECH", "HSI": "hk-HSI", "HSCEI": "hk-HSCEI", "HSTECH": "hk-HSTECH",
+            "SPX": "us-INX", "GSPC": "us-INX", "标普500": "us-INX",
+            "NDX": "us-NDX", "纳斯达克100": "us-NDX", "NASDAQ100": "us-NDX",
+            "DJI": "us-DJI", "IXIC": "us-IXIC", "KOSPI": "kr-KOSPI", "KOSDAQ": "kr-KOSDAQ",
+            "三星": "kr-005930", "三星电子": "kr-005930", "005930": "kr-005930",
+            "AAPL": "us-AAPL", "苹果": "us-AAPL", "NVDA": "us-NVDA", "英伟达": "us-NVDA",
+            "TSLA": "us-TSLA", "特斯拉": "us-TSLA",
+            "XAU": "fx-XAUUSD", "XAUUSD": "fx-XAUUSD", "FX_XAUUSD": "fx-XAUUSD", "伦敦金": "fx-XAUUSD",
+            "AU0": "sf-AU0", "沪金": "sf-AU0", "沪金主连": "sf-AU0",
+            "USDCNH": "fx-USDCNH", "FX_USDCNH": "fx-USDCNH", "离岸人民币": "fx-USDCNH",
+            "DXY": "fx-DXY", "FX_DXY": "fx-DXY", "美元指数": "fx-DXY",
+        ]
+        if let id = aliases[value], let item = preset(id: id) { return item }
+
+        let prefix = value.prefix(2)
+        if ["SH", "SZ", "BJ"].contains(String(prefix)), value.count >= 4 {
+            let code = String(value.dropFirst(2))
+            let regionCode = String(prefix).lowercased()
+            return MarketInstrument(id: "cn-\(regionCode)\(code)", region: .cn,
+                                    providerCode: "\(regionCode)\(code)", symbol: code,
+                                    name: code, currency: "CNY", isIndex: false)
+        }
+        if prefix == "HK", value.count >= 5 {
+            let code = String(value.dropFirst(2))
+            return MarketInstrument(id: "hk-\(code)", region: .hk, providerCode: "hk\(code)",
+                                    symbol: code, name: code, currency: "HKD", isIndex: false)
+        }
+        if prefix == "US", value.count > 2 {
+            let code = String(value.dropFirst(2))
+            return MarketInstrument(id: "us-\(code)", region: .us, providerCode: "us\(code)",
+                                    symbol: code, name: code, currency: "USD", isIndex: false)
+        }
+        if prefix == "KR", value.count >= 8 {
+            let code = String(value.dropFirst(2))
+            return MarketInstrument(id: "kr-\(code)", region: .kr, providerCode: code,
+                                    symbol: code, name: code, currency: "KRW", isIndex: false)
+        }
+        if prefix == "FX" {
+            let code = String(value.dropFirst(2))
+            if ["XAUUSD", "USDCNH", "DXY"].contains(code) { return parse(code) }
+        }
+        if ["SF", "DF", "ZF", "CF", "GF"].contains(String(prefix)), value.count > 2 {
+            let code = String(value.dropFirst(2))
+            let names = ["AU": "沪金", "CU": "沪铜", "AG": "沪银", "IF": "沪深300期指"]
+            let root = String(code.prefix { $0.isLetter })
+            return MarketInstrument(id: "\(prefix.lowercased())-\(code)", region: .domesticFutures,
+                                    providerCode: code, symbol: code,
+                                    name: names[root] ?? code, currency: "CNY", isIndex: false)
+        }
+        if prefix == "HF", value.count > 2 {
+            let code = String(value.dropFirst(2))
+            let names = ["GC": "COMEX黄金", "SI": "COMEX白银", "CL": "WTI原油", "XAU": "伦敦金"]
+            return MarketInstrument(id: "hf-\(code)", region: .globalFutures,
+                                    providerCode: code, symbol: code,
+                                    name: names[code] ?? code, currency: "USD", isIndex: false)
+        }
+        if value.count == 5, value.allSatisfy(\.isNumber) {
+            return parse("HK\(value)")
+        }
+        if value.count == 6, value.allSatisfy(\.isNumber) {
+            let code = value
+            if code.hasPrefix("600") || code.hasPrefix("601") || code.hasPrefix("603") ||
+                code.hasPrefix("605") || code.hasPrefix("688") || code.hasPrefix("689") {
+                return parse("SH\(code)")
+            }
+            if code.hasPrefix("000") || code.hasPrefix("001") || code.hasPrefix("002") ||
+                code.hasPrefix("003") || code.hasPrefix("300") || code.hasPrefix("301") {
+                return parse("SZ\(code)")
+            }
+        }
+        if value.allSatisfy({ $0.isLetter || $0 == "." || $0 == "-" }) {
+            let ticker = value.replacingOccurrences(of: "-", with: ".")
+            return MarketInstrument(id: "us-\(ticker)", region: .us, providerCode: "us\(ticker)",
+                                    symbol: ticker, name: ticker, currency: "USD", isIndex: false)
+        }
+        return nil
+    }
+}
+
+struct MarketCandle {
+    let time: TimeInterval
+    let low: Double
+    let high: Double
+    let open: Double
+    let close: Double
+}
+
+typealias BTCCandle = MarketCandle
+
+struct MarketSnapshot {
+    var instrument: MarketInstrument = .btc
+    var interval: MarketInterval = .fiveMinutes
+    var candles: [MarketCandle] = []
+    var price = 0.0
+    var change24h = 0.0
+    var source = ""
+    var updatedAt: Date?
+    var stale = true
+    var marketOpen = false
+    var lineOnly = false
+}
+
+typealias BTCMarketSnapshot = MarketSnapshot
+
+final class MarketMonitor {
+    static let maxFavorites = 15
+    private static let favoritesKey = "market_favorite_ids"
+    private static let refreshIntervalKey = "market_refresh_interval"
+    // The development build briefly seeded these 15 entries. Treat that exact
+    // list as a generated seed, not as user-curated favorites, so it migrates
+    // to the smaller default list with room for custom symbols.
+    private static let legacySeedIDs = [
+        "btc-usd", "eth-usd", "cn-sh000001", "cn-sz399001", "cn-sh000300",
+        "hk-HSI", "hk-HSTECH", "us-NDX", "us-INX", "us-DJI", "us-AAPL",
+        "us-NVDA", "us-TSLA", "kr-KOSPI", "kr-005930",
+    ]
+    private let queue = DispatchQueue(label: "aiclock.market")
+    private let lock = NSLock()
+    private var timer: DispatchSourceTimer?
+    private var refreshInterval = MarketRefreshInterval.tenSeconds
+    private var value = MarketSnapshot()
+    // `value` is the complete frame currently safe to show. A rotation only
+    // changes the requested instrument; it never replaces this with an empty
+    // snapshot while the remote API is still loading.
+    private var requestedInstrument = MarketInstrument.btc
+    private var requestedInterval: MarketInterval = .fiveMinutes
+    private var favoriteItems: [MarketInstrument] = []
+    private var rotationIndex = 0
+    private var cachedFrame = Data()
+    private var cachedFrameKey = ""
+    private var cachedPackedFrame = Data()
+    private var snapshotCache: [String: MarketSnapshot] = [:]
+    private var frameCache: [String: Data] = [:]
+    private var inFlightKeys = Set<String>()
+    private var retryAfter: [String: TimeInterval] = [:]
+    private var frameVersion: UInt64 = 1
+    /// Changes on every bridge launch. The device uses this to accept version
+    /// counters from a restarted bridge even if the Mac clock moved backward.
+    private let frameSession = UUID().uuidString
+
+    var snapshot: MarketSnapshot {
+        lock.lock(); defer { lock.unlock() }
+        var copy = value
+        if let at = copy.updatedAt {
+            // A 120-second cadence can legitimately leave a frame unchanged
+            // for a little over two minutes while a provider is responding.
+            // Keep the stale marker useful without flagging the chosen cadence
+            // itself as an error.
+            let staleAfter = max(120.0, refreshInterval.seconds * 2.0)
+            copy.stale = Date().timeIntervalSince(at) > staleAfter
+        }
+        return copy
+    }
+
+    /// The selected item (which may be preloading) rather than the last
+    /// completed frame. The HTTP `/btc` and `/btc/frame.raw` routes continue
+    /// to expose `snapshot`, i.e. the complete frame that is actually shown.
+    var instrument: MarketInstrument {
+        lock.lock(); defer { lock.unlock() }
+        return requestedInstrument
+    }
+
+    var favorites: [MarketInstrument] {
+        lock.lock(); defer { lock.unlock() }
+        return favoriteItems
+    }
+
+    var selectedRefreshInterval: MarketRefreshInterval {
+        lock.lock(); defer { lock.unlock() }
+        return refreshInterval
+    }
+
+    var frameRGB565: Data {
+        let current = snapshot
+        let key = Self.frameKey(current)
+        lock.lock()
+        if !cachedFrame.isEmpty, cachedFrameKey == key {
+            let frame = cachedFrame
+            lock.unlock()
+            return frame
+        }
+        lock.unlock()
+        let frame = MarketFrameRenderer.rgb565(snapshot: current)
+        lock.lock()
+        // Rendering happens outside the lock. Only publish it if the complete
+        // snapshot is still current; otherwise a just-finished older render
+        // could overwrite the frame selected by the menu or rotation timer.
+        if Self.frameKey(value) == key {
+            cachedFrame = frame
+            cachedFrameKey = key
+        }
+        lock.unlock()
+        return frame
+    }
+
+    /// Versioned wire frame for the C3. The eight-byte big-endian version is
+    /// deliberately separate from `frameRGB565`, which remains the 115200-byte
+    /// local mirror format used by the Mac popover and tests.
+    var frameEnvelope: Data {
+        lock.lock()
+        let current = value
+        let key = Self.frameKey(current)
+        if !cachedFrame.isEmpty, cachedFrameKey == key {
+            let frame = cachedFrame
+            let version = frameVersion
+            lock.unlock()
+            return Self.makeFrameEnvelope(frame: frame, version: version)
+        }
+        lock.unlock()
+        let frame = frameRGB565
+        lock.lock()
+        let version = frameVersion
+        let currentFrame = cachedFrame.isEmpty ? frame : cachedFrame
+        lock.unlock()
+        return Self.makeFrameEnvelope(frame: currentFrame, version: version)
+    }
+
+    private static func makeFrameEnvelope(frame: Data, version: UInt64) -> Data {
+        var out = Data(capacity: 8 + frame.count)
+        for shift in stride(from: 56, through: 0, by: -8) {
+            out.append(UInt8((version >> UInt64(shift)) & 0xff))
+        }
+        out.append(frame)
+        return out
+    }
+
+    /// Fully rendered, compressed and checksummed frame used by ESP32-C3.
+    /// It is prepared when the market snapshot changes, not in the HTTP
+    /// request path, so even the first byte can be served immediately.
+    var packedFrameEnvelope: Data {
+        lock.lock(); defer { lock.unlock() }
+        return cachedPackedFrame
+    }
+
+    var frameVersionJSON: Data {
+        lock.lock()
+        let version = frameVersion
+        let s = value
+        let packedBytes = cachedPackedFrame.count
+        // Keep the session empty for the initial WAITING frame. On a bridge
+        // restart this lets the device retain its last good market screen
+        // until the first real quote is fully rendered and ready to replace it.
+        let session = version > 1 ? frameSession : ""
+        lock.unlock()
+        let object: [String: Any] = [
+            "version": NSNumber(value: version),
+            "session": session,
+            "bytes": 240 * 240 * 2,
+            "packed_bytes": packedBytes,
+            "codec": "rgb565-packbits-v1",
+            "instrument": s.instrument.id,
+            "interval": s.interval.rawValue,
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
+    }
+
+    init() {
+        let savedIDs = UserDefaults.standard.stringArray(forKey: Self.favoritesKey)
+        let storedOrDefaultIDs = (savedIDs == nil || savedIDs == Self.legacySeedIDs)
+            ? MarketInstrument.defaultFavorites.map(\.id) : savedIDs!
+        let loaded = storedOrDefaultIDs
+            .compactMap { MarketInstrument.preset(id: $0) ?? MarketInstrument.parse($0) }
+        favoriteItems = Array(loaded.prefix(Self.maxFavorites))
+        if favoriteItems.isEmpty { favoriteItems = Array(MarketInstrument.defaultFavorites.prefix(Self.maxFavorites)) }
+        if let id = UserDefaults.standard.string(forKey: "market_instrument_id"),
+           let saved = MarketInstrument.preset(id: id) ?? MarketInstrument.parse(id) {
+            value.instrument = saved
+        }
+        if let raw = UserDefaults.standard.string(forKey: "btc_interval"),
+           let saved = MarketInterval(rawValue: raw) {
+            value.interval = saved
+        }
+        if let raw = UserDefaults.standard.string(forKey: Self.refreshIntervalKey),
+           let saved = MarketRefreshInterval(rawValue: raw) {
+            refreshInterval = saved
+        }
+        requestedInstrument = value.instrument
+        requestedInterval = value.interval
+        cachedFrame = MarketFrameRenderer.rgb565(snapshot: value)
+        cachedFrameKey = Self.frameKey(value)
+        cachedPackedFrame = MarketFrameCodec.envelope(
+            packed: MarketFrameCodec.packRGB565(cachedFrame), version: frameVersion)
+        let initialKey = cacheKey(value.instrument, interval: value.interval)
+        snapshotCache[initialKey] = value
+        frameCache[initialKey] = cachedFrame
+        if let index = favoriteItems.firstIndex(of: value.instrument) { rotationIndex = index }
+    }
+
+    deinit {
+        timer?.cancel()
+    }
+
+    func start() {
+        guard timer == nil else { return }
+        let cadence = selectedRefreshInterval.seconds
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + cadence, repeating: cadence)
+        timer.setEventHandler { [weak self] in self?.cadenceTick() }
+        timer.resume()
+        self.timer = timer
+
+        // The initial fetch also primes the next favorite. Subsequent ticks
+        // run through one state machine, avoiding same-deadline timer races.
+        queue.async { [weak self] in self?.refresh() }
+    }
+
+    func setRefreshInterval(_ interval: MarketRefreshInterval) {
+        lock.lock()
+        refreshInterval = interval
+        let dataTimer = timer
+        lock.unlock()
+        UserDefaults.standard.set(interval.rawValue, forKey: Self.refreshIntervalKey)
+
+        dataTimer?.schedule(deadline: .now() + interval.seconds,
+                            repeating: interval.seconds)
+        queue.async { [weak self] in self?.refresh() }
+    }
+
+    func setInterval(_ interval: MarketInterval) {
+        lock.lock()
+        requestedInterval = interval
+        let target = requestedInstrument
+        let key = cacheKey(target, interval: interval)
+        let cached = snapshotCache[key]
+        let cachedFrame = frameCache[key]
+        lock.unlock()
+        UserDefaults.standard.set(interval.rawValue, forKey: "btc_interval")
+        if let cached, let cachedFrame { activate(cached, frame: cachedFrame) }
+        request(target, interval: interval)
+    }
+
+    func setInstrument(_ instrument: MarketInstrument) {
+        lock.lock()
+        requestedInstrument = instrument
+        let interval = requestedInterval
+        let key = cacheKey(instrument, interval: interval)
+        let cached = snapshotCache[key]
+        let cachedFrame = frameCache[key]
+        if let index = favoriteItems.firstIndex(of: instrument) { rotationIndex = index }
+        lock.unlock()
+        UserDefaults.standard.set(instrument.id, forKey: "market_instrument_id")
+        if let cached, let cachedFrame { activate(cached, frame: cachedFrame) }
+        request(instrument, interval: interval)
+    }
+
+    /// Adds an instrument to the rotation list. Selecting an existing favorite
+    /// succeeds; a new item is rejected only once the 15-item cap is reached.
+    @discardableResult
+    func addFavorite(_ instrument: MarketInstrument) -> Bool {
+        lock.lock()
+        if let index = favoriteItems.firstIndex(of: instrument) {
+            rotationIndex = index
+            lock.unlock()
+            return true
+        }
+        guard favoriteItems.count < Self.maxFavorites else {
+            lock.unlock()
+            return false
+        }
+        favoriteItems.append(instrument)
+        rotationIndex = favoriteItems.count - 1
+        let ids = favoriteItems.map(\.id)
+        lock.unlock()
+        UserDefaults.standard.set(ids, forKey: Self.favoritesKey)
+        return true
+    }
+
+    /// Removes a favorite from the K-line rotation list. At least one item is
+    /// retained so refresh, prefetch and the full-screen page always have a
+    /// valid target. Removing the visible item activates its nearest neighbor.
+    @discardableResult
+    func removeFavorite(id: String) -> Bool {
+        lock.lock()
+        guard favoriteItems.count > 1,
+              let removedIndex = favoriteItems.firstIndex(where: { $0.id == id }) else {
+            lock.unlock()
+            return false
+        }
+        let removedCurrent = requestedInstrument.id == id
+        favoriteItems.remove(at: removedIndex)
+        var replacement: MarketInstrument?
+        if removedCurrent {
+            rotationIndex = min(removedIndex, favoriteItems.count - 1)
+            replacement = favoriteItems[rotationIndex]
+        } else if let currentIndex = favoriteItems.firstIndex(where: { $0.id == requestedInstrument.id }) {
+            rotationIndex = currentIndex
+        } else {
+            rotationIndex = min(rotationIndex, favoriteItems.count - 1)
+        }
+        let ids = favoriteItems.map(\.id)
+        lock.unlock()
+        UserDefaults.standard.set(ids, forKey: Self.favoritesKey)
+        if let replacement { setInstrument(replacement) }
+        return true
+    }
+
+    func jsonData() -> Data {
+        let s = snapshot
+        let dict: [String: Any] = [
+            "pair": s.instrument.symbol, "market": s.instrument.region.rawValue,
+            "name": s.instrument.name, "currency": s.instrument.currency,
+            "interval": s.interval.rawValue, "price": s.price,
+            "change_24h": s.change24h, "source": s.source, "stale": s.stale,
+            "market_open": s.marketOpen, "line_only": s.lineOnly,
+            "updated_at": s.updatedAt?.timeIntervalSince1970 ?? 0,
+            "candles": s.candles.map { [$0.time, $0.open, $0.high, $0.low, $0.close] },
+        ]
+        return (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
+    }
+
+    private func cacheKey(_ instrument: MarketInstrument, interval: MarketInterval) -> String {
+        "\(instrument.id)|\(interval.rawValue)"
+    }
+
+    private func nextFrameVersionLocked() -> UInt64 {
+        let now = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
+        frameVersion = max(now, frameVersion + 1)
+        return frameVersion
+    }
+
+    private static func frameKey(_ snapshot: MarketSnapshot) -> String {
+        "\(snapshot.instrument.id)|\(snapshot.interval.rawValue)|" +
+            "\(snapshot.updatedAt?.timeIntervalSince1970 ?? 0)|" +
+            "\(snapshot.stale)|\(snapshot.lineOnly)"
+    }
+
+    /// Atomically swaps only a complete, rendered frame. The old frame stays
+    /// visible until this function runs, so a slow API never creates a blank
+    /// or half-populated market page.
+    private func activate(_ snapshot: MarketSnapshot, frame: Data) {
+        let packed = MarketFrameCodec.packRGB565(frame)
+        lock.lock()
+        guard requestedInstrument.id == snapshot.instrument.id,
+              requestedInterval == snapshot.interval else {
+            lock.unlock()
+            return
+        }
+        let pixelsChanged = cachedFrame != frame || cachedPackedFrame.isEmpty
+        value = snapshot
+        cachedFrame = frame
+        cachedFrameKey = Self.frameKey(snapshot)
+        if pixelsChanged {
+            let version = nextFrameVersionLocked()
+            cachedPackedFrame = MarketFrameCodec.envelope(packed: packed, version: version)
+        }
+        lock.unlock()
+    }
+
+    private func refresh() {
+        lock.lock()
+        let target = requestedInstrument
+        let interval = requestedInterval
+        lock.unlock()
+        request(target, interval: interval)
+    }
+
+    /// Refresh and rotation deliberately share one serial cadence. Rotating
+    /// first publishes the frame prepared during the previous dwell period;
+    /// `setInstrument` then refreshes it and starts preloading its successor.
+    private func cadenceTick() {
+        lock.lock()
+        let shouldRotate = favoriteItems.count > 1
+        lock.unlock()
+        if shouldRotate { rotateFavoriteIfReady() } else { refresh() }
+    }
+
+    /// Fetches one instrument at a time per cache key. A prefetch request and
+    /// a later user/rotation selection share the same in-flight request; when
+    /// it completes, the current selection is activated automatically.
+    private func request(_ instrument: MarketInstrument, interval: MarketInterval) {
+        let key = cacheKey(instrument, interval: interval)
+        lock.lock()
+        let isCurrentTarget = requestedInstrument.id == instrument.id && requestedInterval == interval
+        guard !inFlightKeys.contains(key) else {
+            lock.unlock()
+            // A prefetch can still be running when its item becomes current.
+            // Continue the pipeline so the following favorite gets a full
+            // dwell interval to load instead of waiting for the next tick.
+            if isCurrentTarget { prefetchNext() }
+            return
+        }
+        inFlightKeys.insert(key)
+        lock.unlock()
+
+        // Start the next request while this one is in flight. For crypto and
+        // Korean endpoints this hides most of the WAN latency behind the
+        // current screen's dwell time.
+        if isCurrentTarget { prefetchNext() }
+
+        fetchMarket(instrument, interval: interval) { [weak self] result in
+            self?.queue.async { [weak self] in
+                self?.finishRequest(result, instrument: instrument, interval: interval, key: key)
+            }
+        }
+    }
+
+    private func prefetchNext() {
+        lock.lock()
+        guard favoriteItems.count > 1, !favoriteItems.isEmpty else {
+            lock.unlock()
+            return
+        }
+        let interval = requestedInterval
+        let now = Date().timeIntervalSince1970
+        var next: MarketInstrument?
+        for offset in 1..<favoriteItems.count {
+            let candidate = favoriteItems[(rotationIndex + offset) % favoriteItems.count]
+            let key = cacheKey(candidate, interval: interval)
+            let ready = snapshotCache[key] != nil && frameCache[key] != nil
+            // The first ready successor is enough for an atomic next switch.
+            if ready { break }
+            if inFlightKeys.contains(key) { break }
+            if (retryAfter[key] ?? 0) > now { continue }
+            next = candidate
+            break
+        }
+        lock.unlock()
+        if let next { request(next, interval: interval) }
+    }
+
+    private func finishRequest(_ result: Result<MarketSnapshot, Error>,
+                               instrument: MarketInstrument, interval: MarketInterval, key: String) {
+        guard case let .success(snapshot) = result else {
+            lock.lock()
+            inFlightKeys.remove(key)
+            // One unreachable provider must not head-of-line block every
+            // later favorite. Skip it for 30 seconds and immediately warm
+            // the next viable candidate; the favorite itself is preserved.
+            retryAfter[key] = Date().timeIntervalSince1970 + 30
+            lock.unlock()
+            prefetchNext()
+            return
+        }
+        let frame = MarketFrameRenderer.rgb565(snapshot: snapshot)
+        lock.lock()
+        inFlightKeys.remove(key)
+        retryAfter.removeValue(forKey: key)
+        snapshotCache[key] = snapshot
+        frameCache[key] = frame
+        let shouldActivate = requestedInstrument.id == instrument.id && requestedInterval == interval
+        lock.unlock()
+        if shouldActivate { activate(snapshot, frame: frame) }
+    }
+
+    private func fetchMarket(_ instrument: MarketInstrument, interval: MarketInterval,
+                             completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        switch instrument.region {
+        case .crypto:
+            fetchCoinbase(instrument, interval: interval) { [weak self] result in
+                switch result {
+                case .success:
+                    completion(result)
+                case .failure:
+                    self?.fetchBitstamp(instrument, interval: interval, completion: completion)
+                }
+            }
+        case .kr:
+            fetchNaver(instrument, interval: interval, completion: completion)
+        case .cn, .hk, .us:
+            fetchTencent(instrument, interval: interval, completion: completion)
+        case .domesticFutures:
+            fetchSinaDomesticFutures(instrument, interval: interval, completion: completion)
+        case .globalFutures:
+            fetchSinaGlobalFutures(instrument, interval: interval, completion: completion)
+        case .forex:
+            if instrument.providerCode == "100.UDI" {
+                fetchEastmoneyDXY(instrument, interval: interval, completion: completion)
+            } else {
+                fetchSinaForex(instrument, interval: interval, completion: completion)
+            }
+        }
+    }
+
+    /// Never expose provider latency as a late visual transition. A favorite
+    /// only becomes current when both its snapshot and rendered frame were
+    /// completed during the previous dwell; otherwise the current frame stays
+    /// on screen and the missing successor keeps preloading in the background.
+    private func rotateFavoriteIfReady() {
+        lock.lock()
+        guard favoriteItems.count > 1 else { lock.unlock(); return }
+        let interval = requestedInterval
+        var nextIndex: Int?
+        for offset in 1..<favoriteItems.count {
+            let candidateIndex = (rotationIndex + offset) % favoriteItems.count
+            let candidate = favoriteItems[candidateIndex]
+            let key = cacheKey(candidate, interval: interval)
+            if snapshotCache[key] != nil && frameCache[key] != nil {
+                nextIndex = candidateIndex
+                break
+            }
+        }
+        let next = nextIndex.map { favoriteItems[$0] }
+        if let nextIndex { rotationIndex = nextIndex }
+        lock.unlock()
+        if let next {
+            setInstrument(next)
+        } else {
+            // Keep the visible quote current even when every successor is
+            // still loading or temporarily unreachable.
+            refresh()
+            prefetchNext()
+        }
+    }
+
+    private func getJSON(_ url: URL, completion: @escaping (Result<Any, Error>) -> Void) {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        request.setValue("AIClockBridge/1.0", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error { completion(.failure(error)); return }
+            guard let data, (response as? HTTPURLResponse)?.statusCode == 200 else {
+                completion(.failure(Self.marketError("HTTP 请求失败"))); return
+            }
+            do { completion(.success(try JSONSerialization.jsonObject(with: data))) }
+            catch { completion(.failure(error)) }
+        }.resume()
+    }
+
+    private func getText(_ url: URL, completion: @escaping (Result<String, Error>) -> Void) {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        request.setValue("AIClockBridge/1.0", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error { completion(.failure(error)); return }
+            guard let data, (response as? HTTPURLResponse)?.statusCode == 200 else {
+                completion(.failure(Self.marketError("行情请求失败"))); return
+            }
+            completion(.success(String(decoding: data, as: UTF8.self)))
+        }.resume()
+    }
+
+    private static func jsonpObject(_ text: String) -> Any? {
+        guard let start = text.firstIndex(of: "("), let end = text.lastIndex(of: ")"), start < end else { return nil }
+        let json = Data(text[text.index(after: start)..<end].utf8)
+        return try? JSONSerialization.jsonObject(with: json)
+    }
+
+    private func fetchSinaDomesticFutures(_ instrument: MarketInstrument, interval: MarketInterval,
+                                          completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let scale = interval.rawValue.replacingOccurrences(of: "m", with: "")
+        let url = URL(string: "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_x=/InnerFuturesNewService.getFewMinLine?symbol=\(instrument.providerCode)&type=\(scale)")!
+        getText(url) { result in
+            guard case let .success(text) = result,
+                  let rows = Self.jsonpObject(text) as? [[String: Any]] else {
+                completion(.failure(Self.marketError("新浪国内期货解析失败"))); return
+            }
+            let candles = rows.compactMap { row -> MarketCandle? in
+                guard let rawTime = row["d"],
+                      let time = Self.parseTime(rawTime, timeZone: instrument.region.timeZone),
+                      let open = Self.number(row["o"]), let high = Self.number(row["h"]),
+                      let low = Self.number(row["l"]), let close = Self.number(row["c"]) else { return nil }
+                return MarketCandle(time: time, low: low, high: high, open: open, close: close)
+            }.suffix(36)
+            guard let last = candles.last else {
+                completion(.failure(Self.marketError("新浪国内期货无数据"))); return
+            }
+            let previous = candles.first?.open ?? last.close
+            completion(.success(Self.snapshot(instrument: instrument, interval: interval,
+                                               quote: TencentQuote(price: last.close, previous: previous),
+                                               candles: Array(candles), source: "Sina Futures", lineOnly: false)))
+        }
+    }
+
+    private func fetchSinaGlobalFutures(_ instrument: MarketInstrument, interval: MarketInterval,
+                                        completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let url = URL(string: "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_x=/GlobalFuturesService.getGlobalFuturesMinLine?symbol=\(instrument.providerCode)&type=1")!
+        getText(url) { result in
+            guard case let .success(text) = result,
+                  let root = Self.jsonpObject(text) as? [String: Any],
+                  let rows = root["minLine_1d"] as? [[Any]] else {
+                completion(.failure(Self.marketError("新浪国际行情解析失败"))); return
+            }
+            let raw = rows.compactMap { row -> MarketCandle? in
+                guard row.count >= 2, let price = Self.number(row[1]) else { return nil }
+                let rawTime: Any = row.count > 5 ? row[row.count - 1] : row[0]
+                guard let time = Self.parseTime(rawTime, timeZone: instrument.region.timeZone) else { return nil }
+                return MarketCandle(time: time, low: price, high: price, open: price, close: price)
+            }
+            let candles = Self.aggregate(raw, interval: interval)
+            guard let last = candles.last else {
+                completion(.failure(Self.marketError("新浪国际行情无数据"))); return
+            }
+            completion(.success(Self.snapshot(instrument: instrument, interval: interval,
+                                               quote: TencentQuote(price: last.close,
+                                                                   previous: candles.first?.open ?? last.close),
+                                               candles: candles, source: "Sina Global", lineOnly: true)))
+        }
+    }
+
+    private func fetchSinaForex(_ instrument: MarketInstrument, interval: MarketInterval,
+                                completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let scale = interval.rawValue.replacingOccurrences(of: "m", with: "")
+        let url = URL(string: "https://vip.stock.finance.sina.com.cn/forex/api/jsonp.php/var%20_x=/NewForexService.getMinKline?symbol=\(instrument.providerCode)&scale=\(scale)&datalen=36")!
+        getText(url) { result in
+            guard case let .success(text) = result,
+                  let rows = Self.jsonpObject(text) as? [[String: Any]] else {
+                completion(.failure(Self.marketError("新浪外汇解析失败"))); return
+            }
+            let candles = rows.compactMap { row -> MarketCandle? in
+                guard let rawTime = row["d"],
+                      let time = Self.parseTime(rawTime, timeZone: instrument.region.timeZone),
+                      let open = Self.number(row["o"]), let high = Self.number(row["h"]),
+                      let low = Self.number(row["l"]), let close = Self.number(row["c"]) else { return nil }
+                return MarketCandle(time: time, low: low, high: high, open: open, close: close)
+            }
+            guard let last = candles.last else {
+                completion(.failure(Self.marketError("新浪外汇无数据"))); return
+            }
+            completion(.success(Self.snapshot(instrument: instrument, interval: interval,
+                                               quote: TencentQuote(price: last.close,
+                                                                   previous: candles.first?.open ?? last.close),
+                                               candles: candles, source: "Sina Forex", lineOnly: false)))
+        }
+    }
+
+    private func fetchEastmoneyDXY(_ instrument: MarketInstrument, interval: MarketInterval,
+                                   completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let klt = interval == .oneMinute ? 1 : interval == .fiveMinutes ? 5 : 60
+        let fields1 = "f1,f2,f3,f4,f5,f6"
+        let fields2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+        let url = URL(string: "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=100.UDI&fields1=\(fields1)&fields2=\(fields2)&klt=\(klt)&fqt=1&beg=0&end=20500101&lmt=36")!
+        getJSON(url) { result in
+            let candles = Self.parseEastmoney(result.successValue, timeZone: instrument.region.timeZone)
+            guard let last = candles.last else {
+                completion(.failure(Self.marketError("东方财富美元指数无数据"))); return
+            }
+            completion(.success(Self.snapshot(instrument: instrument, interval: interval,
+                                               quote: TencentQuote(price: last.close,
+                                                                   previous: candles.first?.open ?? last.close),
+                                               candles: candles, source: "Eastmoney", lineOnly: false)))
+        }
+    }
+
+    private func fetchTencent(_ instrument: MarketInstrument, interval: MarketInterval,
+                              completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let code = instrument.providerCode
+        let group = DispatchGroup()
+        var quoteText: String?
+        var klineObject: Any?
+        group.enter()
+        getText(URL(string: "https://qt.gtimg.cn/q=\(code)")!) { result in
+            if case let .success(text) = result { quoteText = text }
+            group.leave()
+        }
+        group.enter()
+        if instrument.region == .us {
+            group.leave()
+        } else {
+            let url: URL
+            if instrument.region == .cn {
+                url = URL(string: "https://ifzq.gtimg.cn/appstock/app/kline/mkline?param=\(code),\(interval.rawValue),,36")!
+            } else {
+                url = URL(string: "https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=\(code),\(interval.rawValue),,,36,qfq")!
+            }
+            getJSON(url) { result in
+                if case let .success(object) = result { klineObject = object }
+                group.leave()
+            }
+        }
+        group.notify(queue: queue) { [weak self] in
+            guard let self, let quoteText, let quote = Self.parseTencentQuote(quoteText) else {
+                completion(.failure(Self.marketError("腾讯报价解析失败"))); return
+            }
+            if instrument.region == .us {
+                self.fetchTencentMinute(instrument, interval: interval, quote: quote, completion: completion)
+                return
+            }
+            let candles = Self.parseTencentKlines(klineObject, code: code, key: interval.rawValue,
+                                                  timeZone: instrument.region.timeZone)
+            if !candles.isEmpty {
+                completion(.success(Self.snapshot(instrument: instrument, interval: interval, quote: quote,
+                                                   candles: candles, source: "Tencent", lineOnly: false)))
+                return
+            }
+            self.fetchTencentDaily(instrument, interval: interval, quote: quote, completion: completion)
+        }
+    }
+
+    private func fetchTencentMinute(_ instrument: MarketInstrument, interval: MarketInterval, quote: TencentQuote,
+                                    completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let route: String
+        switch instrument.region {
+        case .us: route = "UsMinute/query"
+        case .hk: route = "HkMinute/query"
+        case .cn: route = "minute/query"
+        default:
+            completion(.failure(Self.marketError("分钟线不支持"))); return
+        }
+        getJSON(URL(string: "https://ifzq.gtimg.cn/appstock/app/\(route)?code=\(instrument.providerCode)")!) { [weak self] result in
+            guard let self else { return }
+            self.queue.async {
+                guard case let .success(object) = result,
+                      let rows = Self.tencentMinuteRows(object, code: instrument.providerCode) else {
+                    completion(.success(Self.snapshot(instrument: instrument, interval: interval, quote: quote,
+                                                       candles: [], source: "Tencent", lineOnly: true)))
+                    return
+                }
+                let candles = Self.lineCandles(rows, interval: interval, timeZone: instrument.region.timeZone)
+                completion(.success(Self.snapshot(instrument: instrument, interval: interval, quote: quote,
+                                                   candles: candles, source: "Tencent", lineOnly: true)))
+            }
+        }
+    }
+
+    private func fetchTencentDaily(_ instrument: MarketInstrument, interval: MarketInterval, quote: TencentQuote,
+                                   completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let url = URL(string: "https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=\(instrument.providerCode),day,,,36,qfq")!
+        getJSON(url) { [weak self] result in
+            guard let self else { return }
+            self.queue.async {
+                let dayCandles = Self.parseTencentKlines(result.successValue, code: instrument.providerCode, key: "day",
+                                                         timeZone: instrument.region.timeZone)
+                let candles = dayCandles.isEmpty
+                    ? Self.parseTencentKlines(result.successValue, code: instrument.providerCode, key: "qfqday",
+                                              timeZone: instrument.region.timeZone)
+                    : dayCandles
+                if !candles.isEmpty {
+                    completion(.success(Self.snapshot(instrument: instrument, interval: interval, quote: quote,
+                                                       candles: candles, source: "Tencent-DAY", lineOnly: false)))
+                } else if instrument.region == .cn {
+                    self.fetchEastmoney(instrument, interval: interval, quote: quote, completion: completion)
+                } else {
+                    self.fetchTencentMinute(instrument, interval: interval, quote: quote, completion: completion)
+                }
+            }
+        }
+    }
+
+    private func fetchEastmoney(_ instrument: MarketInstrument, interval: MarketInterval, quote: TencentQuote,
+                                completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let code = String(instrument.providerCode.dropFirst(2))
+        let market = instrument.providerCode.hasPrefix("sh") ? "1" : "0"
+        let fields1 = "f1,f2,f3,f4,f5,f6"
+        let fields2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+        let urlString = "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=\(market).\(code)&ut=7eea3edcaed734bea9cbfc24409ed989&fields1=\(fields1)&fields2=\(fields2)&klt=\(interval.seconds == 60 ? 1 : interval.seconds == 300 ? 5 : 60)&fqt=1&beg=0&end=20500101&smplmt=460&lmt=36"
+        getJSON(URL(string: urlString)!) { [weak self] result in
+            guard let self else { return }
+            self.queue.async {
+                let candles = Self.parseEastmoney(result.successValue, timeZone: instrument.region.timeZone)
+                if candles.isEmpty {
+                    self.fetchTencentMinute(instrument, interval: interval, quote: quote, completion: completion)
+                } else {
+                    completion(.success(Self.snapshot(instrument: instrument, interval: interval, quote: quote,
+                                                       candles: candles, source: "Eastmoney", lineOnly: false)))
+                }
+            }
+        }
+    }
+
+    private func fetchNaver(_ instrument: MarketInstrument, interval: MarketInterval,
+                            completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let isIndex = instrument.providerCode == "KOSPI" || instrument.providerCode == "KOSDAQ"
+        let basicPath = isIndex ? "index/\(instrument.providerCode)" : "stock/\(instrument.providerCode)"
+        let quoteURL = URL(string: "https://m.stock.naver.com/api/\(basicPath)/basic")!
+        let now = Date()
+        let start = Self.formatted(now, timeZone: MarketRegion.kr.timeZone, format: "yyyyMMdd") + "090000"
+        let end = Self.formatted(now, timeZone: MarketRegion.kr.timeZone, format: "yyyyMMddHHmmss")
+        let chartPath = isIndex ? "index/\(instrument.providerCode)" : "item/\(instrument.providerCode)"
+        let chartURL = URL(string: "https://api.stock.naver.com/chart/domestic/\(chartPath)/minute?startTime=\(start)&endTime=\(end)")!
+        let group = DispatchGroup()
+        var quoteObject: Any?
+        var chartObject: Any?
+        group.enter(); getJSON(quoteURL) { result in
+            if case let .success(object) = result { quoteObject = object }; group.leave()
+        }
+        group.enter(); getJSON(chartURL) { result in
+            if case let .success(object) = result { chartObject = object }; group.leave()
+        }
+        group.notify(queue: queue) {
+            let quote = Self.parseNaverQuote(quoteObject, marketOpen: Self.marketOpen(.kr))
+            guard let quote else { completion(.failure(Self.marketError("Naver 报价解析失败"))); return }
+            let oneMinute = Self.parseNaverCandles(chartObject)
+            let candles = Self.aggregate(oneMinute, interval: interval)
+            completion(.success(Self.snapshot(instrument: instrument, interval: interval, quote: quote,
+                                               candles: candles, source: "Naver", lineOnly: false)))
+        }
+    }
+
+    private func fetchCoinbase(_ instrument: MarketInstrument, interval: MarketInterval,
+                               completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let base = "https://api.exchange.coinbase.com/products/\(instrument.providerCode)"
+        let group = DispatchGroup()
+        var candleObj: Any?, statsObj: Any?
+        group.enter(); getJSON(URL(string: "\(base)/candles?granularity=\(interval.seconds)")!) { r in
+            if case let .success(v) = r { candleObj = v }; group.leave()
+        }
+        group.enter(); getJSON(URL(string: "\(base)/stats")!) { r in
+            if case let .success(v) = r { statsObj = v }; group.leave()
+        }
+        group.notify(queue: queue) {
+            guard let rows = candleObj as? [[Any]], let stats = statsObj as? [String: Any] else {
+                completion(.failure(Self.marketError("Coinbase 解析失败"))); return
+            }
+            let candles = rows.compactMap(Self.coinbaseCandle).sorted { $0.time < $1.time }.suffix(36)
+            let price = Self.number(stats["last"]) ?? candles.last?.close ?? 0
+            let open = Self.number(stats["open"]) ?? price
+            let quote = TencentQuote(price: price, previous: open)
+            completion(.success(Self.snapshot(instrument: instrument, interval: interval, quote: quote,
+                                               candles: Array(candles), source: "Coinbase", lineOnly: false)))
+        }
+    }
+
+    private func fetchBitstamp(_ instrument: MarketInstrument, interval: MarketInterval,
+                               completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
+        let base = "https://www.bitstamp.net/api/v2"
+        let pair = instrument.providerCode.replacingOccurrences(of: "-", with: "").lowercased()
+        let group = DispatchGroup()
+        var ohlcObj: Any?, tickerObj: Any?
+        group.enter(); getJSON(URL(string: "\(base)/ohlc/\(pair)/?step=\(interval.seconds)&limit=36")!) { r in
+            if case let .success(v) = r { ohlcObj = v }; group.leave()
+        }
+        group.enter(); getJSON(URL(string: "\(base)/ticker/\(pair)/")!) { r in
+            if case let .success(v) = r { tickerObj = v }; group.leave()
+        }
+        group.notify(queue: queue) {
+            let data = (ohlcObj as? [String: Any])?["data"] as? [String: Any]
+            guard let rows = data?["ohlc"] as? [[String: Any]], let ticker = tickerObj as? [String: Any] else {
+                completion(.failure(Self.marketError("Bitstamp 解析失败"))); return
+            }
+            let candles = rows.compactMap { row -> MarketCandle? in
+                guard let t = Self.number(row["timestamp"]) else { return nil }
+                return MarketCandle(time: t, low: Self.number(row["low"]) ?? 0,
+                                    high: Self.number(row["high"]) ?? 0,
+                                    open: Self.number(row["open"]) ?? 0,
+                                    close: Self.number(row["close"]) ?? 0)
+            }.sorted { $0.time < $1.time }
+            let price = Self.number(ticker["last"]) ?? candles.last?.close ?? 0
+            let open = Self.number(ticker["open"]) ?? price
+            completion(.success(Self.snapshot(instrument: instrument, interval: interval,
+                                               quote: TencentQuote(price: price, previous: open), candles: candles,
+                                               source: "Bitstamp", lineOnly: false)))
+        }
+    }
+
+    private struct TencentQuote {
+        let price: Double
+        let previous: Double
+    }
+
+    private static func snapshot(instrument: MarketInstrument, interval: MarketInterval, quote: TencentQuote,
+                                 candles: [MarketCandle], source: String, lineOnly: Bool) -> MarketSnapshot {
+        MarketSnapshot(instrument: instrument, interval: interval, candles: Array(candles.suffix(36)),
+                       price: quote.price, change24h: quote.previous > 0 ? (quote.price / quote.previous - 1) * 100 : 0,
+                       source: source, updatedAt: Date(), stale: false,
+                       marketOpen: marketOpen(instrument.region), lineOnly: lineOnly)
+    }
+
+    private static func parseTencentQuote(_ text: String) -> TencentQuote? {
+        guard let equal = text.firstIndex(of: "=") else { return nil }
+        var payload = String(text[text.index(after: equal)...])
+        if payload.first == "\"" { payload.removeFirst() }
+        if let end = payload.firstIndex(of: "\"") { payload = String(payload[..<end]) }
+        let fields = payload.split(separator: "~", omittingEmptySubsequences: false).map(String.init)
+        guard fields.count > 4, let price = number(fields[3]), let previous = number(fields[4]), price > 0 else { return nil }
+        return TencentQuote(price: price, previous: previous)
+    }
+
+    private static func parseTencentKlines(_ object: Any?, code: String, key: String,
+                                           timeZone: TimeZone) -> [MarketCandle] {
+        guard let root = object as? [String: Any], let data = root["data"] as? [String: Any],
+              let item = data[code] as? [String: Any],
+              let rows = item[key] as? [[Any]] else { return [] }
+        return rows.compactMap { row in
+            guard row.count >= 5, let time = parseTime(row[0], timeZone: timeZone),
+                  let open = number(row[1]), let close = number(row[2]),
+                  let high = number(row[3]), let low = number(row[4]) else { return nil }
+            return MarketCandle(time: time, low: low, high: high, open: open, close: close)
+        }.sorted { $0.time < $1.time }
+    }
+
+    private static func parseEastmoney(_ object: Any?, timeZone: TimeZone) -> [MarketCandle] {
+        guard let root = object as? [String: Any], let data = root["data"] as? [String: Any],
+              let rows = data["klines"] as? [String] else { return [] }
+        return rows.compactMap { row in
+            let f = row.split(separator: ",").map(String.init)
+            guard f.count >= 5, let time = parseTime(f[0], timeZone: timeZone),
+                  let open = number(f[1]), let close = number(f[2]),
+                  let high = number(f[3]), let low = number(f[4]) else { return nil }
+            return MarketCandle(time: time, low: low, high: high, open: open, close: close)
+        }.sorted { $0.time < $1.time }
+    }
+
+    private static func tencentMinuteRows(_ object: Any, code: String) -> [(String, Double)]? {
+        guard let root = object as? [String: Any], let data = root["data"] as? [String: Any],
+              let item = data[code] as? [String: Any], let day = item["data"] as? [String: Any],
+              let rows = day["data"] as? [String] else { return nil }
+        return rows.compactMap { row in
+            let fields = row.split(separator: " ").map(String.init)
+            guard fields.count >= 2, let price = number(fields[1]) else { return nil }
+            return (fields[0], price)
+        }
+    }
+
+    private static func lineCandles(_ rows: [(String, Double)], interval: MarketInterval,
+                                    timeZone: TimeZone) -> [MarketCandle] {
+        let raw = rows.enumerated().compactMap { index, row -> MarketCandle? in
+            let time = parseTime(row.0, timeZone: timeZone) ?? Date().timeIntervalSince1970 + Double(index)
+            let previous = index > 0 ? rows[index - 1].1 : row.1
+            return MarketCandle(time: time, low: min(previous, row.1), high: max(previous, row.1),
+                                open: previous, close: row.1)
+        }
+        return aggregate(raw, interval: interval)
+    }
+
+    private static func parseNaverQuote(_ object: Any?, marketOpen: Bool) -> TencentQuote? {
+        guard let dict = object as? [String: Any], let price = number(dict["closePrice"]), price > 0 else { return nil }
+        let previous = number(dict["compareToPreviousClosePrice"]).map { price - $0 } ?? price
+        return TencentQuote(price: price, previous: previous)
+    }
+
+    private static func parseNaverCandles(_ object: Any?) -> [MarketCandle] {
+        let rows: [[String: Any]]
+        if let typed = object as? [[String: Any]] { rows = typed }
+        else if let array = object as? [Any] { rows = array.compactMap { $0 as? [String: Any] } }
+        else { return [] }
+        return rows.compactMap { row in
+            guard let rawTime = row["localDateTime"], let time = parseTime(rawTime, timeZone: MarketRegion.kr.timeZone),
+                  let close = number(row["currentPrice"]), let open = number(row["openPrice"]),
+                  let high = number(row["highPrice"]), let low = number(row["lowPrice"]) else { return nil }
+            return MarketCandle(time: time, low: low, high: high, open: open, close: close)
+        }.sorted { $0.time < $1.time }
+    }
+
+    private static func aggregate(_ candles: [MarketCandle], interval: MarketInterval) -> [MarketCandle] {
+        guard interval != .oneMinute else { return Array(candles.suffix(36)) }
+        var grouped: [Int: [MarketCandle]] = [:]
+        for candle in candles { grouped[Int(candle.time) / interval.seconds, default: []].append(candle) }
+        return grouped.keys.sorted().compactMap { key in
+            guard let group = grouped[key]?.sorted(by: { $0.time < $1.time }), let first = group.first,
+                  let last = group.last else { return nil }
+            return MarketCandle(time: first.time, low: group.map(\.low).min() ?? first.low,
+                                high: group.map(\.high).max() ?? first.high, open: first.open, close: last.close)
+        }.suffix(36).map { $0 }
+    }
+
+    private static func coinbaseCandle(_ row: [Any]) -> MarketCandle? {
+        guard row.count >= 5 else { return nil }
+        let n = row.map { number($0) ?? 0 }
+        return MarketCandle(time: n[0], low: n[1], high: n[2], open: n[3], close: n[4])
+    }
+
+    private static func parseTime(_ value: Any, timeZone: TimeZone) -> TimeInterval? {
+        if let n = value as? NSNumber {
+            let v = n.doubleValue
+            if v > 100_000_000_000 {
+                return parseTime(String(Int64(v)), timeZone: timeZone)
+            }
+            return v > 10_000_000_000 ? v / 1000 : v
+        }
+        guard let text = value as? String else { return nil }
+        let formats = ["yyyyMMddHHmmss", "yyyyMMddHHmm", "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm",
+                       "yyyy-MM-dd", "yyyy/MM/dd HH:mm:ss", "HHmm"]
+        for format in formats {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = timeZone
+            formatter.dateFormat = format
+            if let date = formatter.date(from: text) {
+                if format == "HHmm" {
+                    let now = Calendar(identifier: .gregorian).dateComponents(in: timeZone, from: Date())
+                    var c = DateComponents(); c.year = now.year; c.month = now.month; c.day = now.day
+                    c.hour = Calendar(identifier: .gregorian).dateComponents([.hour], from: date).hour
+                    c.minute = Calendar(identifier: .gregorian).dateComponents([.minute], from: date).minute
+                    return Calendar(identifier: .gregorian).date(from: c).map { $0.timeIntervalSince1970 }
+                }
+                return date.timeIntervalSince1970
+            }
+        }
+        return Double(text)
+    }
+
+    private static func formatted(_ date: Date, timeZone: TimeZone, format: String) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = format
+        return formatter.string(from: date)
+    }
+
+    private static func marketOpen(_ region: MarketRegion, now: Date = Date()) -> Bool {
+        if region == .crypto { return true }
+        var calendar = Calendar(identifier: .gregorian); calendar.timeZone = region.timeZone
+        let parts = calendar.dateComponents([.weekday, .hour, .minute], from: now)
+        guard let weekday = parts.weekday, (2...6).contains(weekday), let hour = parts.hour, let minute = parts.minute else { return false }
+        let current = hour * 60 + minute
+        switch region {
+        case .cn, .domesticFutures: return (570...690).contains(current) || (780...900).contains(current)
+        case .hk: return (570...720).contains(current) || (780...960).contains(current)
+        case .us: return (570...960).contains(current)
+        case .kr: return (540...930).contains(current)
+        case .crypto, .globalFutures, .forex: return true
+        }
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let n = value as? NSNumber { return n.doubleValue }
+        if let s = value as? String { return Double(s.replacingOccurrences(of: ",", with: "")) }
+        return nil
+    }
+
+    private static func marketError(_ message: String) -> NSError {
+        NSError(domain: "Market", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+}
+
+private extension Result where Success == Any {
+    var successValue: Any? {
+        if case let .success(value) = self { return value }
+        return nil
+    }
+}
+
+enum MarketFrameRenderer {
+    private static func bitmap(snapshot: MarketSnapshot) -> NSBitmapImageRep {
+        let context = CGContext(data: nil, width: 240, height: 240, bitsPerComponent: 8,
+                                bytesPerRow: 240 * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.translateBy(x: 240, y: 240); context.scaleBy(x: -1, y: -1)
+        context.translateBy(x: 240, y: 0); context.scaleBy(x: -1, y: 1)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+        render(snapshot: snapshot, in: CGRect(x: 0, y: 0, width: 240, height: 240))
+        NSGraphicsContext.restoreGraphicsState()
+        return NSBitmapImageRep(cgImage: context.makeImage()!)
+    }
+
+    static func png(snapshot: MarketSnapshot) -> Data? {
+        bitmap(snapshot: snapshot).representation(using: .png, properties: [:])
+    }
+
+    static func rgb565(snapshot: MarketSnapshot) -> Data {
+        let rendered = bitmap(snapshot: snapshot)
+        guard let bitmap = rendered.bitmapData else { return Data() }
+        var out = Data(capacity: 240 * 240 * 2)
+        for y in 0..<240 {
+            for x in 0..<240 {
+                let i = y * rendered.bytesPerRow + x * 4
+                let r = UInt16(bitmap[i]), g = UInt16(bitmap[i + 1]), b = UInt16(bitmap[i + 2])
+                let v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                out.append(UInt8(v >> 8)); out.append(UInt8(v & 0xFF))
+            }
+        }
+        return out
+    }
+
+    static func render(snapshot s: MarketSnapshot, in rect: CGRect) {
+        NSColor.black.setFill(); rect.fill()
+        let titleFont = NSFont.monospacedSystemFont(ofSize: s.instrument.name.count > 8 ? 8 : 10, weight: .semibold)
+        let title = "\(s.instrument.name)  \(s.instrument.symbol)  \(s.interval.rawValue)"
+        (title as NSString).draw(at: CGPoint(x: 8, y: 8), withAttributes: [.font: titleFont, .foregroundColor: NSColor(white: 0.72, alpha: 1)])
+        let price = formatPrice(s.price, currency: s.instrument.currency)
+        (price as NSString).draw(at: CGPoint(x: 8, y: 22), withAttributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 23, weight: .bold), .foregroundColor: NSColor.white,
+        ])
+        let up = s.change24h >= 0
+        let move = String(format: "%@%.2f%%", up ? "+" : "", s.change24h)
+        (move as NSString).draw(at: CGPoint(x: 158, y: 31), withAttributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold), .foregroundColor: movementColor(s.instrument.region, up: up),
+        ])
+        let chart = CGRect(x: 9, y: 58, width: 222, height: 153)
+        NSColor(white: 0.12, alpha: 1).setStroke()
+        for q in 0...3 {
+            let y = chart.minY + chart.height * CGFloat(q) / 3
+            NSBezierPath.strokeLine(from: CGPoint(x: chart.minX, y: y), to: CGPoint(x: chart.maxX, y: y))
+        }
+        guard !s.candles.isEmpty else {
+            let empty = (s.stale ? "WAITING FOR MARKET" : "NO INTRADAY DATA") as NSString
+            empty.draw(at: CGPoint(x: 48, y: 130), withAttributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium),
+                .foregroundColor: NSColor.darkGray,
+            ])
+            drawFooter(s, at: 220)
+            return
+        }
+        let low = s.candles.map(\.low).min() ?? 0, high = s.candles.map(\.high).max() ?? 1
+        let span = max(high - low, max(abs(high), 1) * 0.0001), step = chart.width / CGFloat(s.candles.count)
+        func py(_ v: Double) -> CGFloat { chart.maxY - CGFloat((v - low) / span) * chart.height }
+        if s.lineOnly {
+            let path = NSBezierPath()
+            for (i, c) in s.candles.enumerated() {
+                let point = CGPoint(x: chart.minX + step * (CGFloat(i) + 0.5), y: py(c.close))
+                if i == 0 { path.move(to: point) } else { path.line(to: point) }
+            }
+            movementColor(s.instrument.region, up: s.change24h >= 0).setStroke()
+            path.lineWidth = 2; path.stroke()
+        } else {
+            let bodyW = max(2, step * 0.58)
+            for (i, c) in s.candles.enumerated() {
+                let x = chart.minX + step * (CGFloat(i) + 0.5)
+                let color = movementColor(s.instrument.region, up: c.close >= c.open)
+                color.setStroke(); NSBezierPath.strokeLine(from: CGPoint(x: x, y: py(c.low)), to: CGPoint(x: x, y: py(c.high)))
+                color.setFill()
+                let y0 = py(max(c.open, c.close)), y1 = py(min(c.open, c.close))
+                CGRect(x: x - bodyW / 2, y: y0, width: bodyW, height: max(2, y1 - y0)).fill()
+            }
+        }
+        drawFooter(s, at: 220)
+    }
+
+    private static func drawFooter(_ s: MarketSnapshot, at y: CGFloat) {
+        let state = s.stale ? "STALE" : (s.marketOpen ? "LIVE" : "CLOSED")
+        let footer = "\(s.source.uppercased())  \(state)"
+        (footer as NSString).draw(at: CGPoint(x: 10, y: y), withAttributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium),
+            .foregroundColor: s.stale ? NSColor.systemRed : NSColor(white: 0.45, alpha: 1),
+        ])
+    }
+
+    private static func formatPrice(_ price: Double, currency: String) -> String {
+        guard price > 0 else { return "--" }
+        switch currency {
+        case "USD": return String(format: "$%.2f", price)
+        case "KRW": return String(format: "₩%.0f", price)
+        case "CNY": return String(format: "¥%.2f", price)
+        case "HKD": return String(format: "HK$%.2f", price)
+        default: return String(format: "%.2f", price)
+        }
+    }
+
+    private static func movementColor(_ region: MarketRegion, up: Bool) -> NSColor {
+        switch region {
+        case .cn, .hk, .kr, .domesticFutures: return up ? NSColor.systemRed : NSColor.systemGreen
+        case .crypto, .us, .globalFutures, .forex: return up ? NSColor.systemGreen : NSColor.systemRed
+        }
+    }
+}
+
+typealias BTCFrameRenderer = MarketFrameRenderer
