@@ -239,6 +239,8 @@ struct MarketInstrument: Equatable, Codable {
             case "HK": return parse("HK\(tail)")
             case "US": return parse("US\(tail)")
             case "KR": return parse("KR\(tail)")
+            case "FX", "SF", "DF", "ZF", "CF", "GF", "HF":
+                return parse("\(family)\(tail)")
             default: break
             }
         }
@@ -822,7 +824,32 @@ final class MarketMonitor {
             fetchSinaGlobalFutures(instrument, interval: interval, completion: completion)
         case .forex:
             if instrument.providerCode == "100.UDI" {
-                fetchEastmoneyDXY(instrument, interval: interval, completion: completion)
+                fetchEastmoneyDXY(instrument, interval: interval) { [weak self] result in
+                    switch result {
+                    case .success:
+                        completion(result)
+                    case .failure:
+                        // Sina publishes the same index as DINIW. It is a
+                        // useful independent fallback when Eastmoney's
+                        // historical endpoint is slow or temporarily empty.
+                        self?.fetchSinaForex(instrument, interval: interval,
+                                             providerCode: "DINIW", completion: completion)
+                    }
+                }
+            } else if instrument.id == MarketInstrument.londonGold.id {
+                fetchSinaForex(instrument, interval: interval) { [weak self] result in
+                    switch result {
+                    case .success:
+                        completion(result)
+                    case .failure:
+                        // Some mainland networks return no rows for Sina's
+                        // fx_sxauusd K-line route. The global XAU minute feed
+                        // remains broadly reachable, so reconstruct candles
+                        // from consecutive prices rather than skipping XAU.
+                        self?.fetchSinaGlobalFutures(instrument, interval: interval,
+                                                     providerCode: "XAU", completion: completion)
+                    }
+                }
             } else {
                 fetchSinaForex(instrument, interval: interval, completion: completion)
             }
@@ -874,10 +901,12 @@ final class MarketMonitor {
         }.resume()
     }
 
-    private func getText(_ url: URL, completion: @escaping (Result<String, Error>) -> Void) {
+    private func getText(_ url: URL, referer: String? = nil,
+                         completion: @escaping (Result<String, Error>) -> Void) {
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
         request.setValue("AIClockBridge/1.0", forHTTPHeaderField: "User-Agent")
+        if let referer { request.setValue(referer, forHTTPHeaderField: "Referer") }
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error { completion(.failure(error)); return }
             guard let data, (response as? HTTPURLResponse)?.statusCode == 200 else {
@@ -897,7 +926,7 @@ final class MarketMonitor {
                                           completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
         let scale = interval.rawValue.replacingOccurrences(of: "m", with: "")
         let url = URL(string: "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_x=/InnerFuturesNewService.getFewMinLine?symbol=\(instrument.providerCode)&type=\(scale)")!
-        getText(url) { result in
+        getText(url, referer: "https://finance.sina.com.cn/") { result in
             guard case let .success(text) = result,
                   let rows = Self.jsonpObject(text) as? [[String: Any]] else {
                 completion(.failure(Self.marketError("新浪国内期货解析失败"))); return
@@ -920,20 +949,23 @@ final class MarketMonitor {
     }
 
     private func fetchSinaGlobalFutures(_ instrument: MarketInstrument, interval: MarketInterval,
+                                        providerCode: String? = nil,
                                         completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
-        let url = URL(string: "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_x=/GlobalFuturesService.getGlobalFuturesMinLine?symbol=\(instrument.providerCode)&type=1")!
-        getText(url) { result in
+        let code = providerCode ?? instrument.providerCode
+        let url = URL(string: "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_x=/GlobalFuturesService.getGlobalFuturesMinLine?symbol=\(code)&type=1")!
+        getText(url, referer: "https://finance.sina.com.cn/") { result in
             guard case let .success(text) = result,
                   let root = Self.jsonpObject(text) as? [String: Any],
                   let rows = root["minLine_1d"] as? [[Any]] else {
                 completion(.failure(Self.marketError("新浪国际行情解析失败"))); return
             }
-            let raw = rows.compactMap { row -> MarketCandle? in
+            let points = rows.compactMap { row -> (TimeInterval, Double)? in
                 guard row.count >= 2, let price = Self.number(row[1]) else { return nil }
                 let rawTime: Any = row.count > 5 ? row[row.count - 1] : row[0]
                 guard let time = Self.parseTime(rawTime, timeZone: instrument.region.timeZone) else { return nil }
-                return MarketCandle(time: time, low: price, high: price, open: price, close: price)
+                return (time, price)
             }
+            let raw = Self.candlesFromPricePoints(points)
             let candles = Self.aggregate(raw, interval: interval)
             guard let last = candles.last else {
                 completion(.failure(Self.marketError("新浪国际行情无数据"))); return
@@ -941,15 +973,17 @@ final class MarketMonitor {
             completion(.success(Self.snapshot(instrument: instrument, interval: interval,
                                                quote: TencentQuote(price: last.close,
                                                                    previous: candles.first?.open ?? last.close),
-                                               candles: candles, source: "Sina Global", lineOnly: true)))
+                                               candles: candles, source: "Sina Global fallback", lineOnly: false)))
         }
     }
 
     private func fetchSinaForex(_ instrument: MarketInstrument, interval: MarketInterval,
+                                providerCode: String? = nil,
                                 completion: @escaping (Result<MarketSnapshot, Error>) -> Void) {
         let scale = interval.rawValue.replacingOccurrences(of: "m", with: "")
-        let url = URL(string: "https://vip.stock.finance.sina.com.cn/forex/api/jsonp.php/var%20_x=/NewForexService.getMinKline?symbol=\(instrument.providerCode)&scale=\(scale)&datalen=36")!
-        getText(url) { result in
+        let code = providerCode ?? instrument.providerCode
+        let url = URL(string: "https://vip.stock.finance.sina.com.cn/forex/api/jsonp.php/var%20_x=/NewForexService.getMinKline?symbol=\(code)&scale=\(scale)&datalen=36")!
+        getText(url, referer: "https://finance.sina.com.cn/") { result in
             guard case let .success(text) = result,
                   let rows = Self.jsonpObject(text) as? [[String: Any]] else {
                 completion(.failure(Self.marketError("新浪外汇解析失败"))); return
@@ -976,7 +1010,7 @@ final class MarketMonitor {
         let klt = interval == .oneMinute ? 1 : interval == .fiveMinutes ? 5 : 60
         let fields1 = "f1,f2,f3,f4,f5,f6"
         let fields2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
-        let url = URL(string: "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=100.UDI&fields1=\(fields1)&fields2=\(fields2)&klt=\(klt)&fqt=1&beg=0&end=20500101&lmt=36")!
+        let url = URL(string: "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=100.UDI&ut=7eea3edcaed734bea9cbfc24409ed989&fields1=\(fields1)&fields2=\(fields2)&klt=\(klt)&fqt=1&beg=0&end=20500101&smplmt=460&lmt=36")!
         getJSON(url) { result in
             let candles = Self.parseEastmoney(result.successValue, timeZone: instrument.region.timeZone)
             guard let last = candles.last else {
@@ -1258,6 +1292,18 @@ final class MarketMonitor {
                                 open: previous, close: row.1)
         }
         return aggregate(raw, interval: interval)
+    }
+
+    /// Converts a provider's timestamp/last-price series into candle bodies.
+    /// It is intentionally used only as a fallback when the provider does not
+    /// publish OHLC: each point opens at the prior price and closes at the
+    /// current price, after which normal 5/60-minute aggregation applies.
+    static func candlesFromPricePoints(_ points: [(TimeInterval, Double)]) -> [MarketCandle] {
+        points.enumerated().map { index, point in
+            let previous = index > 0 ? points[index - 1].1 : point.1
+            return MarketCandle(time: point.0, low: min(previous, point.1),
+                                high: max(previous, point.1), open: previous, close: point.1)
+        }
     }
 
     private static func parseNaverQuote(_ object: Any?, marketOpen: Bool) -> TencentQuote? {
