@@ -168,8 +168,13 @@ struct MarketInstrument: Equatable, Codable {
                                        symbol: "NVDA", name: "NVIDIA", currency: "USD", isIndex: false)
     static let tsla = MarketInstrument(id: "us-TSLA", region: .us, providerCode: "usTSLA",
                                        symbol: "TSLA", name: "Tesla", currency: "USD", isIndex: false)
-    static let londonGold = MarketInstrument(id: "fx-XAUUSD", region: .globalFutures,
-                                              providerCode: "XAU", symbol: "XAU/USD",
+    // London spot gold is also published by Sina's forex K-line service. Use
+    // that route instead of the global-futures minute-line feed: the forex
+    // response contains real open/high/low/close values for 1/5/60 minutes,
+    // while the minute-line response only contains one price per minute and
+    // can therefore render only a time-sharing line.
+    static let londonGold = MarketInstrument(id: "fx-XAUUSD", region: .forex,
+                                              providerCode: "fx_sxauusd", symbol: "XAU/USD",
                                               name: "伦敦金", currency: "USD", isIndex: false)
     static let shfeGold = MarketInstrument(id: "sf-AU0", region: .domesticFutures,
                                             providerCode: "AU0", symbol: "AU0",
