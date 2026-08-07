@@ -486,6 +486,8 @@ final class MarketMonitor {
         let version = frameVersion
         let s = value
         let packedBytes = cachedPackedFrame.count
+        let favoriteCount = favoriteItems.count
+        let refreshSeconds = Int(refreshInterval.seconds)
         // Keep the session empty for the initial WAITING frame. On a bridge
         // restart this lets the device retain its last good market screen
         // until the first real quote is fully rendered and ready to replace it.
@@ -499,6 +501,8 @@ final class MarketMonitor {
             "codec": "rgb565-packbits-v1",
             "instrument": s.instrument.id,
             "interval": s.interval.rawValue,
+            "favorite_count": favoriteCount,
+            "refresh_seconds": refreshSeconds,
         ]
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
     }

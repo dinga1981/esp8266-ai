@@ -303,7 +303,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     @objc private func configureAutoCycle() {
         DeviceClient.fetchInfo { result in
             guard case let .success(info) = result else {
-                Self.toast("无法读取设置", "请确认设备在线且已安装 v0.5.1 或更高版本固件。")
+                Self.toast("无法读取设置", "请确认设备在线且已安装 v0.5.2 或更高版本固件。")
                 return
             }
             let pageOptions = [
@@ -335,7 +335,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
             let alert = NSAlert()
             alert.messageText = "设置自动轮播"
-            alert.informativeText = "按固定顺序轮播已勾选的页面；至少选择一个页面。"
+            alert.informativeText = "普通页面按设定时间切换；K线页会等待全部收藏完整展示一轮。至少选择一个页面。"
             alert.accessoryView = stack
             alert.addButton(withTitle: "保存并切换到自动")
             alert.addButton(withTitle: "取消")

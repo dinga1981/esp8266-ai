@@ -164,6 +164,8 @@ const size_t MARKET_PACKED_MAX_BYTES = 30 * 1024;
 unsigned long lastMarketPollMs = 0;
 uint64_t lastMarketFrameVersion = 0;
 String lastMarketFrameSession;
+bool marketAutoDwellKnown = false;
+unsigned long marketAutoDwellMs = 0;
 
 String musicTitle, musicArtist, musicAlbum;
 bool musicPlaying = false;
@@ -294,7 +296,15 @@ void advanceAutoCycleIfNeeded(unsigned long nowMs) {
   if (displayMode != MODE_AUTO) return;
   const uint8_t count = selectedAutoPageCount();
   if (count == 0) return;
-  if (nowMs - autoPageStartedMs >= (unsigned long)autoCycleSeconds * 1000UL) {
+  unsigned long dwellMs = (unsigned long)autoCycleSeconds * 1000UL;
+  if (autoPageAt(autoPageIndex) == MODE_MARKET) {
+    // Give the bridge a short grace period to report its favorite count and
+    // K-line rotation cadence. Once known, keep this page for one complete
+    // favorite round instead of cutting it off at the outer page interval.
+    if (!marketAutoDwellKnown && nowMs - autoPageStartedMs < 3000UL) return;
+    if (marketAutoDwellKnown && marketAutoDwellMs > dwellMs) dwellMs = marketAutoDwellMs;
+  }
+  if (nowMs - autoPageStartedMs >= dwellMs) {
     autoPageIndex = (autoPageIndex + 1) % count;
     autoPageStartedMs = nowMs;
   }
@@ -1468,6 +1478,14 @@ void pollMarket() {
   http.end();
   if (err) return;
   const char *session = doc["session"] | "";
+  const int favoriteCount = doc["favorite_count"] | 0;
+  const int refreshSeconds = doc["refresh_seconds"] | 0;
+  if (favoriteCount > 0 && favoriteCount <= 15 &&
+      (refreshSeconds == 5 || refreshSeconds == 10 || refreshSeconds == 30 ||
+       refreshSeconds == 60 || refreshSeconds == 120)) {
+    marketAutoDwellMs = (unsigned long)favoriteCount * (unsigned long)refreshSeconds * 1000UL;
+    marketAutoDwellKnown = true;
+  }
   if (session[0] != '\0' && lastMarketFrameSession != session) {
     lastMarketFrameSession = session;
     lastMarketFrameVersion = 0;
@@ -2334,6 +2352,8 @@ void loop() {
     } else if (eff == MODE_MARKET) {
       lastMarketPollMs = 0;
       lastMarketFrameVersion = 0;
+      marketAutoDwellKnown = false;
+      marketAutoDwellMs = 0;
     } else {
       selectEffectivePet(eff);
       drawActiveApp();
