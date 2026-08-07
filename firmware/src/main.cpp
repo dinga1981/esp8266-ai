@@ -73,16 +73,22 @@ unsigned long lastSwitchMs = 0;
 // Display override, settable from the Mac app via POST /api/display:
 // auto = follow working status, claude/codex = pin that app on screen,
 // net/music = show Mac-side telemetry pages instead of the pet.
-enum DisplayMode { MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK, MODE_MARKET };
+enum DisplayMode {
+  MODE_AUTO, MODE_CLAUDE, MODE_CODEX, MODE_NET, MODE_MUSIC, MODE_STOCK, MODE_MARKET,
+  MODE_WEATHER
+};
 DisplayMode displayMode = MODE_AUTO;
 
 // AUTO is a user-configurable carousel. Bit N selects DisplayMode N; AUTO
 // itself is never a carousel page. Default preserves the original two-pet
 // experience until the user changes it from the Mac menu.
-uint8_t autoPageMask = (1U << MODE_CLAUDE) | (1U << MODE_CODEX);
-uint16_t autoCycleSeconds = AUTO_CYCLE_DEFAULT_SECONDS;
+uint8_t weekdayAutoPageMask = (1U << MODE_CODEX);
+uint16_t weekdayAutoCycleSeconds = AUTO_CYCLE_DEFAULT_SECONDS;
+uint8_t weekendAutoPageMask = (1U << MODE_CODEX);
+uint16_t weekendAutoCycleSeconds = AUTO_CYCLE_DEFAULT_SECONDS;
 uint8_t autoPageIndex = 0;
 unsigned long autoPageStartedMs = 0;
+bool lastAutoScheduleWeekend = false;
 
 // When AUTO and the Mac reports audio playing, the screen auto-switches to the
 // music page and back when it stops — same spirit as the Claude/Codex auto
@@ -167,6 +173,29 @@ String lastMarketFrameSession;
 bool marketAutoDwellKnown = false;
 unsigned long marketAutoDwellMs = 0;
 
+// ---------- date/weather mode ----------
+struct WeatherState {
+  String city = "SHANGHAI";
+  String currentText = "WAITING";
+  String todayText = "WAITING";
+  String tomorrowText = "WAITING";
+  float currentTemp = 0;
+  float todayHigh = 0, todayLow = 0;
+  float tomorrowHigh = 0, tomorrowLow = 0;
+  int currentCode = 0, todayCode = 0, tomorrowCode = 0;
+  long utcOffsetSeconds = 8 * 3600;
+  long scheduleUtcOffsetSeconds = 8 * 3600;
+  time_t serverUnix = 0;
+  unsigned long syncedAtMs = 0;
+  bool valid = false;
+  bool stale = true;
+};
+WeatherState weather;
+unsigned long lastWeatherPollMs = 0;
+unsigned long lastWeatherClockMs = 0;
+bool weatherChromeDrawn = false;
+bool weatherDirty = false;
+
 String musicTitle, musicArtist, musicAlbum;
 bool musicPlaying = false;
 int musicElapsed = 0, musicDuration = 0;
@@ -250,18 +279,49 @@ bool validAutoCycleSeconds(int seconds) {
   return seconds == 5 || seconds == 10 || seconds == 30 || seconds == 60 || seconds == 120;
 }
 
+const uint8_t VISIBLE_AUTO_MASK =
+    (1U << MODE_CODEX) | (1U << MODE_MUSIC) | (1U << MODE_STOCK) |
+    (1U << MODE_MARKET) | (1U << MODE_WEATHER);
+
+time_t weatherLocalEpoch() {
+  if (weather.serverUnix <= 0) return 0;
+  return weather.serverUnix + (time_t)((millis() - weather.syncedAtMs) / 1000UL) +
+         (time_t)weather.utcOffsetSeconds;
+}
+
+bool weatherIsWeekend() {
+  if (weather.serverUnix <= 0) return false;
+  time_t localEpoch = weather.serverUnix +
+      (time_t)((millis() - weather.syncedAtMs) / 1000UL) +
+      (time_t)weather.scheduleUtcOffsetSeconds;
+  if (localEpoch <= 0) return false; // before first sync, use weekday schedule
+  struct tm localTm;
+  gmtime_r(&localEpoch, &localTm);
+  return localTm.tm_wday == 0 || localTm.tm_wday == 6;
+}
+
+uint8_t activeAutoPageMask() {
+  return weatherIsWeekend() ? weekendAutoPageMask : weekdayAutoPageMask;
+}
+
+uint16_t activeAutoCycleSeconds() {
+  return weatherIsWeekend() ? weekendAutoCycleSeconds : weekdayAutoCycleSeconds;
+}
+
 uint8_t selectedAutoPageCount() {
   uint8_t count = 0;
-  for (uint8_t mode = MODE_CLAUDE; mode <= MODE_MARKET; ++mode) {
-    if (autoPageMask & (1U << mode)) ++count;
+  const uint8_t mask = activeAutoPageMask();
+  for (uint8_t mode = MODE_CODEX; mode <= MODE_WEATHER; ++mode) {
+    if (mask & (1U << mode)) ++count;
   }
   return count;
 }
 
 DisplayMode autoPageAt(uint8_t selectedIndex) {
   uint8_t found = 0;
-  for (uint8_t mode = MODE_CLAUDE; mode <= MODE_MARKET; ++mode) {
-    if (!(autoPageMask & (1U << mode))) continue;
+  const uint8_t mask = activeAutoPageMask();
+  for (uint8_t mode = MODE_CODEX; mode <= MODE_WEATHER; ++mode) {
+    if (!(mask & (1U << mode))) continue;
     if (found++ == selectedIndex) return (DisplayMode)mode;
   }
   return MODE_CODEX;
@@ -271,32 +331,58 @@ void loadAutoCycle() {
   if (!LittleFS.exists(AUTO_CYCLE_FILE)) return;
   File f = LittleFS.open(AUTO_CYCLE_FILE, "r");
   if (!f) return;
-  const int mask = f.readStringUntil('\n').toInt();
-  const int seconds = f.readStringUntil('\n').toInt();
+  const int weekdayMask = f.readStringUntil('\n').toInt();
+  const int weekdaySeconds = f.readStringUntil('\n').toInt();
+  String weekendMaskLine = f.readStringUntil('\n');
+  String weekendSecondsLine = f.readStringUntil('\n');
   f.close();
-  const uint8_t allowedMask = ((1U << (MODE_MARKET + 1)) - 1U) & ~1U;
-  if ((mask & allowedMask) != 0) autoPageMask = (uint8_t)(mask & allowedMask);
-  if (validAutoCycleSeconds(seconds)) autoCycleSeconds = seconds;
+  uint8_t cleanWeekday = (uint8_t)weekdayMask & VISIBLE_AUTO_MASK;
+  if (cleanWeekday == 0) cleanWeekday = 1U << MODE_CODEX;
+  weekdayAutoPageMask = cleanWeekday;
+  if (validAutoCycleSeconds(weekdaySeconds)) weekdayAutoCycleSeconds = weekdaySeconds;
+
+  // v0.5.5 stored only two lines. Duplicate that schedule for the weekend
+  // when upgrading, so existing users keep the same behavior until editing it.
+  if (weekendMaskLine.length() == 0) {
+    weekendAutoPageMask = weekdayAutoPageMask;
+    weekendAutoCycleSeconds = weekdayAutoCycleSeconds;
+  } else {
+    uint8_t cleanWeekend = (uint8_t)weekendMaskLine.toInt() & VISIBLE_AUTO_MASK;
+    if (cleanWeekend == 0) cleanWeekend = 1U << MODE_CODEX;
+    weekendAutoPageMask = cleanWeekend;
+    const int weekendSeconds = weekendSecondsLine.toInt();
+    if (validAutoCycleSeconds(weekendSeconds)) weekendAutoCycleSeconds = weekendSeconds;
+  }
 }
 
 void saveAutoCycle() {
   File f = LittleFS.open(AUTO_CYCLE_FILE, "w");
   if (!f) return;
-  f.println(autoPageMask);
-  f.println(autoCycleSeconds);
+  f.println(weekdayAutoPageMask);
+  f.println(weekdayAutoCycleSeconds);
+  f.println(weekendAutoPageMask);
+  f.println(weekendAutoCycleSeconds);
   f.close();
 }
 
 void resetAutoCyclePosition() {
   autoPageIndex = 0;
   autoPageStartedMs = millis();
+  lastAutoScheduleWeekend = weatherIsWeekend();
 }
 
 void advanceAutoCycleIfNeeded(unsigned long nowMs) {
   if (displayMode != MODE_AUTO) return;
+  const bool weekend = weatherIsWeekend();
+  if (weekend != lastAutoScheduleWeekend) {
+    lastAutoScheduleWeekend = weekend;
+    autoPageIndex = 0;
+    autoPageStartedMs = nowMs;
+    lastEffectiveMode = MODE_AUTO;
+  }
   const uint8_t count = selectedAutoPageCount();
   if (count == 0) return;
-  unsigned long dwellMs = (unsigned long)autoCycleSeconds * 1000UL;
+  unsigned long dwellMs = (unsigned long)activeAutoCycleSeconds() * 1000UL;
   if (autoPageAt(autoPageIndex) == MODE_MARKET) {
     // Give the bridge a short grace period to report its favorite count and
     // K-line rotation cadence. Once known, keep this page for one complete
@@ -1509,6 +1595,177 @@ void drawStockScreen() {
   }
 }
 
+// ---------- date + weather screen ----------
+
+bool handleWeatherPayload(const String &payload) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return false;
+  const time_t serverUnix = doc["server_unix"] | (time_t)0;
+  if (serverUnix > 0) {
+    weather.serverUnix = serverUnix;
+    weather.syncedAtMs = millis();
+    weather.utcOffsetSeconds = doc["utc_offset_seconds"] | (long)(8 * 3600);
+    weather.scheduleUtcOffsetSeconds = doc["schedule_utc_offset_seconds"] |
+                                       weather.utcOffsetSeconds;
+  }
+  weather.valid = doc["valid"] | false;
+  weather.stale = doc["stale"] | true;
+  if (weather.valid) {
+    weather.city = String((const char *)(doc["city"] | "CITY")).substring(0, 18);
+    weather.currentText = String((const char *)(doc["current_text"] | "WEATHER")).substring(0, 10);
+    weather.todayText = String((const char *)(doc["today_text"] | "WEATHER")).substring(0, 10);
+    weather.tomorrowText = String((const char *)(doc["tomorrow_text"] | "WEATHER")).substring(0, 10);
+    weather.currentTemp = doc["current_temp"] | 0.0;
+    weather.currentCode = doc["current_code"] | 0;
+    weather.todayHigh = doc["today_high"] | 0.0;
+    weather.todayLow = doc["today_low"] | 0.0;
+    weather.todayCode = doc["today_code"] | 0;
+    weather.tomorrowHigh = doc["tomorrow_high"] | 0.0;
+    weather.tomorrowLow = doc["tomorrow_low"] | 0.0;
+    weather.tomorrowCode = doc["tomorrow_code"] | 0;
+  }
+  weatherDirty = true;
+  return true;
+}
+
+void pollWeather() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/weather";
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, url)) return;
+  const int code = http.GET();
+  if (code == HTTP_CODE_OK) handleWeatherPayload(http.getString());
+  http.end();
+}
+
+bool weatherCodeHasRain(int code) {
+  return (code >= 51 && code <= 67) || (code >= 80 && code <= 82) || code >= 95;
+}
+
+bool weatherCodeHasSnow(int code) {
+  return (code >= 71 && code <= 77) || (code >= 85 && code <= 86);
+}
+
+void drawWeatherIcon(int cx, int cy, int size, int code) {
+  const uint16_t yellow = tft.color565(255, 199, 61);
+  const uint16_t cloud = tft.color565(184, 201, 214);
+  const uint16_t rain = tft.color565(84, 191, 255);
+  const bool clear = code == 0;
+  const bool hasSun = code <= 2;
+  if (hasSun) {
+    const int r = clear ? size * 23 / 100 : size * 17 / 100;
+    const int sunY = cy - (clear ? 0 : size * 12 / 100);
+    tft.fillCircle(cx, sunY, r, yellow);
+    if (clear) {
+      for (int i = 0; i < 8; ++i) {
+        const float a = i * PI / 4.0f;
+        tft.drawLine(cx + cos(a) * size * .32f, cy + sin(a) * size * .32f,
+                     cx + cos(a) * size * .45f, cy + sin(a) * size * .45f, yellow);
+      }
+      return;
+    }
+  }
+  const int y = cy + size * 5 / 100;
+  tft.fillRoundRect(cx - size * 36 / 100, y - size * 10 / 100,
+                    size * 72 / 100, size * 30 / 100, size * 15 / 100, cloud);
+  tft.fillCircle(cx, y - size * 10 / 100, size * 22 / 100, cloud);
+  if (weatherCodeHasRain(code) || weatherCodeHasSnow(code)) {
+    for (int i = -1; i <= 1; ++i) {
+      const int x = cx + i * size * 22 / 100;
+      const int y0 = cy + size * 28 / 100;
+      const int slant = weatherCodeHasSnow(code) ? 0 : size * 6 / 100;
+      tft.drawLine(x, y0, x - slant, cy + size * 43 / 100, rain);
+    }
+  }
+}
+
+void drawWeatherClock() {
+  time_t localEpoch = weatherLocalEpoch();
+  struct tm localTm = {};
+  if (localEpoch > 0) gmtime_r(&localEpoch, &localTm);
+  const char *weekdays[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+  char dateText[16], timeText[16];
+  if (localEpoch > 0) {
+    snprintf(dateText, sizeof(dateText), "%02d/%02d %s", localTm.tm_mon + 1,
+             localTm.tm_mday, weekdays[localTm.tm_wday]);
+    snprintf(timeText, sizeof(timeText), "%02d:%02d:%02d", localTm.tm_hour,
+             localTm.tm_min, localTm.tm_sec);
+  } else {
+    strcpy(dateText, "--/-- ---");
+    strcpy(timeText, "--:--:--");
+  }
+  const uint16_t header = tft.color565(17, 35, 51);
+  const uint16_t cyan = tft.color565(125, 217, 255);
+  const uint16_t muted = tft.color565(151, 172, 188);
+  tft.fillRect(0, 0, SCREEN_W, 32, header);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(cyan, header);
+  tft.drawString(weather.city, 9, 9, 1);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(muted, header);
+  tft.drawString(dateText, 231, 9, 1);
+  tft.fillRect(0, 33, SCREEN_W, 43, TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(timeText, SCREEN_CX, 39, 4);
+}
+
+void drawWeatherScreen(bool force) {
+  if (force || !weatherChromeDrawn) {
+    weatherChromeDrawn = true;
+    tft.fillScreen(TFT_BLACK);
+    const uint16_t divider = tft.color565(41, 70, 95);
+    const uint16_t footer = tft.color565(9, 19, 29);
+    tft.drawFastHLine(0, 32, SCREEN_W, divider);
+    tft.fillRect(0, 168, SCREEN_W, 72, footer);
+    tft.drawFastHLine(0, 168, SCREEN_W, divider);
+    tft.drawFastVLine(120, 168, 72, divider);
+    weatherDirty = true;
+  }
+  drawWeatherClock();
+  if (!weatherDirty) return;
+  weatherDirty = false;
+  tft.fillRect(0, 77, SCREEN_W, 90, TFT_BLACK);
+  drawWeatherIcon(69, 119, 56, weather.currentCode);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  String current = weather.valid ? String((int)round(weather.currentTemp)) : "--";
+  tft.drawString(current, 108, 92, 6);
+  int tempWidth = tft.textWidth(current, 6);
+  tft.drawCircle(112 + tempWidth, 98, 3, TFT_WHITE);
+  tft.drawString("C", 119 + tempWidth, 105, 4);
+  tft.setTextColor(tft.color565(125, 217, 255), TFT_BLACK);
+  tft.drawString(weather.valid ? weather.currentText : "WAITING", 109, 143, 2);
+
+  const uint16_t footer = tft.color565(9, 19, 29);
+  const uint16_t muted = tft.color565(151, 172, 188);
+  const uint16_t warm = tft.color565(255, 180, 95);
+  const uint16_t cool = tft.color565(119, 207, 255);
+  tft.fillRect(1, 169, 118, 70, footer);
+  tft.fillRect(121, 169, 119, 70, footer);
+  for (int day = 0; day < 2; ++day) {
+    const int x = day * 120;
+    const int code = day == 0 ? weather.todayCode : weather.tomorrowCode;
+    const String label = day == 0 ? "TODAY" : "TMRW";
+    const String condition = day == 0 ? weather.todayText : weather.tomorrowText;
+    const float high = day == 0 ? weather.todayHigh : weather.tomorrowHigh;
+    const float low = day == 0 ? weather.todayLow : weather.tomorrowLow;
+    drawWeatherIcon(x + 27, 203, 31, code);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(muted, footer);
+    tft.drawString(label, x + 49, 180, 1);
+    tft.drawString(condition.substring(0, 8), x + 49, 191, 1);
+    tft.setTextColor(warm, footer);
+    tft.drawString(weather.valid ? String((int)round(high)) : "--", x + 49, 207, 2);
+    tft.setTextColor(TFT_LIGHTGREY, footer);
+    tft.drawString("/", x + 76, 207, 2);
+    tft.setTextColor(cool, footer);
+    tft.drawString(weather.valid ? String((int)round(low)) : "--", x + 87, 207, 2);
+  }
+}
+
 // ---------- full-screen K-line frame ----------
 
 bool readMarketExact(WiFiClient *stream, uint8_t *dst, size_t length,
@@ -1818,7 +2075,8 @@ void pollBridge() {
   }
   http.end();
   DisplayMode eff = effectiveMode();
-  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_MARKET) {
+  if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK &&
+      eff != MODE_MARKET && eff != MODE_WEATHER) {
     // Only a real app switch clears the screen; a plain data refresh paints
     // in place so the poll doesn't flash the whole display.
     if (selectEffectivePet(eff)) drawActiveApp();
@@ -1864,7 +2122,8 @@ void handleSerialFrame(char *line) {
       everPolled = true;
       showMainUiIfNeeded();
       DisplayMode eff = effectiveMode();
-      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK && eff != MODE_MARKET) {
+      if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK &&
+          eff != MODE_MARKET && eff != MODE_WEATHER) {
         if (selectEffectivePet(eff)) drawActiveApp();
         else refreshActiveApp();
       }
@@ -1877,6 +2136,10 @@ void handleSerialFrame(char *line) {
   }
   if (!strncmp(line, "#STOCK ", 7)) {
     handleStockPayload(String(line + 7));
+    return;
+  }
+  if (!strncmp(line, "#WEATHER ", 9)) {
+    handleWeatherPayload(String(line + 9));
     return;
   }
   if (!strncmp(line, "#CMD ", 5)) {
@@ -1897,6 +2160,7 @@ void handleSerialFrame(char *line) {
       else if (m == "music") displayMode = MODE_MUSIC;
       else if (m == "stock") displayMode = MODE_STOCK;
       else if (m == "market") displayMode = MODE_MARKET;
+      else if (m == "weather") displayMode = MODE_WEATHER;
       // the effectiveMode transition handler in loop() repaints the chrome
     }
     return;
@@ -2021,6 +2285,7 @@ const char *displayModeName(DisplayMode m) {
   if (m == MODE_MUSIC) return "music";
   if (m == MODE_STOCK) return "stock";
   if (m == MODE_MARKET) return "market";
+  if (m == MODE_WEATHER) return "weather";
   return "auto";
 }
 
@@ -2038,10 +2303,19 @@ void handleApiInfo() {
   doc["brightness"] = brightness;
   doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
   doc["fw"] = FW_VERSION;
-  doc["auto_seconds"] = autoCycleSeconds;
+  doc["auto_seconds"] = activeAutoCycleSeconds();
+  doc["auto_schedule"] = weatherIsWeekend() ? "weekend" : "weekday";
   JsonArray autoPages = doc["auto_pages"].to<JsonArray>();
-  for (uint8_t mode = MODE_CLAUDE; mode <= MODE_MARKET; ++mode) {
-    if (autoPageMask & (1U << mode)) autoPages.add(displayModeName((DisplayMode)mode));
+  for (uint8_t mode = MODE_CODEX; mode <= MODE_WEATHER; ++mode) {
+    if (activeAutoPageMask() & (1U << mode)) autoPages.add(displayModeName((DisplayMode)mode));
+  }
+  doc["weekday_auto_seconds"] = weekdayAutoCycleSeconds;
+  JsonArray weekdayPages = doc["weekday_auto_pages"].to<JsonArray>();
+  doc["weekend_auto_seconds"] = weekendAutoCycleSeconds;
+  JsonArray weekendPages = doc["weekend_auto_pages"].to<JsonArray>();
+  for (uint8_t mode = MODE_CODEX; mode <= MODE_WEATHER; ++mode) {
+    if (weekdayAutoPageMask & (1U << mode)) weekdayPages.add(displayModeName((DisplayMode)mode));
+    if (weekendAutoPageMask & (1U << mode)) weekendPages.add(displayModeName((DisplayMode)mode));
   }
   JsonObject c = doc["claude"].to<JsonObject>();
   c["status"] = claudeStatus.status;
@@ -2071,8 +2345,9 @@ void handleApiDisplay() {
   else if (mode == "music") displayMode = MODE_MUSIC;
   else if (mode == "stock") displayMode = MODE_STOCK;
   else if (mode == "market") displayMode = MODE_MARKET;
+  else if (mode == "weather") displayMode = MODE_WEATHER;
   else {
-    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock|market");
+    webServer.send(400, "text/plain", "mode must be auto|claude|codex|net|music|stock|market|weather");
     return;
   }
   Serial.printf("[api] display mode = %s\n", mode.c_str());
@@ -2090,6 +2365,9 @@ void handleApiDisplay() {
   } else if (displayMode == MODE_MARKET) {
     lastMarketPollMs = 0;
     lastMarketFrameVersion = 0; // force a redraw when returning from another page
+  } else if (displayMode == MODE_WEATHER) {
+    weatherChromeDrawn = false;
+    lastWeatherPollMs = 0;
   } else {
     updateActiveApp();
     drawActiveApp(); // unconditional: also repaints over a previous net chart
@@ -2097,40 +2375,50 @@ void handleApiDisplay() {
   webServer.send(200, "text/plain", "ok");
 }
 
-void handleApiAutoCycle() {
-  String pages = webServer.arg("pages");
-  const int seconds = webServer.arg("seconds").toInt();
-  uint8_t mask = 0;
+bool parseAutoPageList(String pages, uint8_t &mask) {
+  mask = 0;
   while (pages.length() > 0) {
     int comma = pages.indexOf(',');
     String page = comma >= 0 ? pages.substring(0, comma) : pages;
     pages = comma >= 0 ? pages.substring(comma + 1) : "";
     page.trim();
-    if (page == "claude") mask |= 1U << MODE_CLAUDE;
-    else if (page == "codex") mask |= 1U << MODE_CODEX;
-    else if (page == "net") mask |= 1U << MODE_NET;
+    if (page == "codex") mask |= 1U << MODE_CODEX;
     else if (page == "music") mask |= 1U << MODE_MUSIC;
     else if (page == "stock") mask |= 1U << MODE_STOCK;
     else if (page == "market") mask |= 1U << MODE_MARKET;
-    else if (page.length() > 0) {
-      webServer.send(400, "text/plain", "unknown auto page: " + page);
-      return;
-    }
+    else if (page == "weather") mask |= 1U << MODE_WEATHER;
+    else if (page.length() > 0) return false;
   }
-  if (mask == 0) {
-    webServer.send(400, "text/plain", "select at least one auto page");
+  return mask != 0;
+}
+
+void handleApiAutoCycle() {
+  const bool splitSchedule = webServer.hasArg("weekday_pages") || webServer.hasArg("weekend_pages");
+  String weekdayPages = splitSchedule ? webServer.arg("weekday_pages") : webServer.arg("pages");
+  String weekendPages = splitSchedule ? webServer.arg("weekend_pages") : webServer.arg("pages");
+  const int weekdaySeconds = (splitSchedule ? webServer.arg("weekday_seconds")
+                                             : webServer.arg("seconds")).toInt();
+  const int weekendSeconds = (splitSchedule ? webServer.arg("weekend_seconds")
+                                             : webServer.arg("seconds")).toInt();
+  uint8_t weekdayMask = 0, weekendMask = 0;
+  if (!parseAutoPageList(weekdayPages, weekdayMask) ||
+      !parseAutoPageList(weekendPages, weekendMask)) {
+    webServer.send(400, "text/plain", "each schedule needs codex|music|stock|market|weather");
     return;
   }
-  if (!validAutoCycleSeconds(seconds)) {
+  if (!validAutoCycleSeconds(weekdaySeconds) || !validAutoCycleSeconds(weekendSeconds)) {
     webServer.send(400, "text/plain", "seconds must be 5|10|30|60|120");
     return;
   }
-  autoPageMask = mask;
-  autoCycleSeconds = seconds;
+  weekdayAutoPageMask = weekdayMask;
+  weekdayAutoCycleSeconds = weekdaySeconds;
+  weekendAutoPageMask = weekendMask;
+  weekendAutoCycleSeconds = weekendSeconds;
   resetAutoCyclePosition();
   saveAutoCycle();
   if (displayMode == MODE_AUTO) lastEffectiveMode = MODE_AUTO;
-  Serial.printf("[api] auto pages mask=%u seconds=%u\n", autoPageMask, autoCycleSeconds);
+  Serial.printf("[api] auto weekday=%u/%u weekend=%u/%u\n", weekdayAutoPageMask,
+                weekdayAutoCycleSeconds, weekendAutoPageMask, weekendAutoCycleSeconds);
   webServer.send(200, "text/plain", "ok");
 }
 
@@ -2540,6 +2828,11 @@ void loop() {
       lastMarketFrameVersion = 0;
       marketAutoDwellKnown = false;
       marketAutoDwellMs = 0;
+    } else if (eff == MODE_WEATHER) {
+      weatherChromeDrawn = false;
+      weatherDirty = true;
+      lastWeatherClockMs = 0;
+      lastWeatherPollMs = 0;
     } else {
       selectEffectivePet(eff);
       drawActiveApp();
@@ -2574,6 +2867,12 @@ void loop() {
     if (nowMs - lastMarketPollMs >= MARKET_POLL_INTERVAL_MS) {
       lastMarketPollMs = nowMs;
       pollMarket();
+    }
+  } else if (eff == MODE_WEATHER) {
+    if (!weatherChromeDrawn) drawWeatherScreen(true);
+    if (nowMs - lastWeatherClockMs >= 1000UL) {
+      lastWeatherClockMs = nowMs;
+      drawWeatherScreen(false);
     }
   } else {
     // sprite walk-cycle animation (only advances while that app is showing)
@@ -2625,5 +2924,12 @@ void loop() {
   if (nowMs - lastPollMs >= BRIDGE_POLL_INTERVAL_MS) {
     lastPollMs = nowMs;
     if (!wiredActive()) pollBridge();
+  }
+  // Weather also supplies the city-local clock used to select the weekday or
+  // weekend carousel schedule, so keep it synchronized even when hidden.
+  if (!wiredActive() &&
+      (lastWeatherPollMs == 0 || nowMs - lastWeatherPollMs >= WEATHER_POLL_INTERVAL_MS)) {
+    lastWeatherPollMs = nowMs;
+    pollWeather();
   }
 }

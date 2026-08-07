@@ -14,6 +14,7 @@ final class SerialLink {
     private let service: StatusService
     private let netMonitor: NetSpeedMonitor
     private let stockMonitor: StockMonitor
+    private let weatherMonitor: WeatherMonitor
 
     private var fd: Int32 = -1
     private var portPath = ""
@@ -22,13 +23,16 @@ final class SerialLink {
     private var lastHelloAt = Date.distantPast
     private var lastStatusAt = Date.distantPast
     private var lastNetAt = Date.distantPast
+    private var lastWeatherAt = Date.distantPast
     private var rxBuf = Data()
     private var timer: Timer?
 
-    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor) {
+    init(service: StatusService, netMonitor: NetSpeedMonitor, stockMonitor: StockMonitor,
+         weatherMonitor: WeatherMonitor) {
         self.service = service
         self.netMonitor = netMonitor
         self.stockMonitor = stockMonitor
+        self.weatherMonitor = weatherMonitor
     }
 
     func start() {
@@ -68,6 +72,10 @@ final class SerialLink {
             lastNetAt = now
             let stats = SystemStatsMonitor.shared.snapshot()
             send(frame("#NET ", netMonitor.jsonData(cpu: stats.cpu, mem: stats.mem)))
+        }
+        if now.timeIntervalSince(lastWeatherAt) > 60 {
+            lastWeatherAt = now
+            send(frame("#WEATHER ", weatherMonitor.jsonData()))
         }
     }
 

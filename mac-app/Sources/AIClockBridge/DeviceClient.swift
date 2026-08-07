@@ -14,8 +14,10 @@ struct DeviceInfo {
     var lastUpdateS = -1    // seconds since the device last got /status data, -1 = never
     var spriteRev = 0       // bumped by the device on animation change
     var brightness = 100    // backlight 0-100 (0 = off)
-    var autoPages = ["claude", "codex"]
-    var autoSeconds = 10
+    var weekdayAutoPages = ["codex"]
+    var weekdayAutoSeconds = 10
+    var weekendAutoPages = ["codex"]
+    var weekendAutoSeconds = 10
     var claudeCustomSprite = false
     var codexCustomSprite = false
     var claudeW = 111, claudeH = 120
@@ -67,8 +69,12 @@ final class DeviceClient {
                 info.lastUpdateS = (obj["last_update_s"] as? NSNumber)?.intValue ?? -1
                 info.spriteRev = (obj["sprite_rev"] as? NSNumber)?.intValue ?? 0
                 info.brightness = (obj["brightness"] as? NSNumber)?.intValue ?? 100
-                info.autoPages = obj["auto_pages"] as? [String] ?? ["claude", "codex"]
-                info.autoSeconds = (obj["auto_seconds"] as? NSNumber)?.intValue ?? 10
+                let legacyPages = obj["auto_pages"] as? [String] ?? ["codex"]
+                let legacySeconds = (obj["auto_seconds"] as? NSNumber)?.intValue ?? 10
+                info.weekdayAutoPages = obj["weekday_auto_pages"] as? [String] ?? legacyPages
+                info.weekdayAutoSeconds = (obj["weekday_auto_seconds"] as? NSNumber)?.intValue ?? legacySeconds
+                info.weekendAutoPages = obj["weekend_auto_pages"] as? [String] ?? legacyPages
+                info.weekendAutoSeconds = (obj["weekend_auto_seconds"] as? NSNumber)?.intValue ?? legacySeconds
                 let claude = obj["claude"] as? [String: Any]
                 let codex = obj["codex"] as? [String: Any]
                 info.claudeCustomSprite = claude?["custom_sprite"] as? Bool ?? false
@@ -85,16 +91,22 @@ final class DeviceClient {
         }.resume()
     }
 
-    /// POST /api/display  mode=auto|claude|codex|net|music|stock|market
+    /// POST /api/display  mode=auto|claude|codex|net|music|stock|market|weather
     static func setDisplayMode(_ mode: String, completion: @escaping (Error?) -> Void) {
         postForm(path: "api/display", fields: ["mode": mode], completion: completion)
     }
 
-    /// POST /api/auto pages=claude,codex,... seconds=5|10|30|60|120
-    static func setAutoCycle(pages: [String], seconds: Int,
-                             completion: @escaping (Error?) -> Void) {
+    /// POST /api/auto with independent Monday-Friday and weekend schedules.
+    static func setAutoSchedule(weekdayPages: [String], weekdaySeconds: Int,
+                                weekendPages: [String], weekendSeconds: Int,
+                                completion: @escaping (Error?) -> Void) {
         postForm(path: "api/auto",
-                 fields: ["pages": pages.joined(separator: ","), "seconds": String(seconds)],
+                 fields: [
+                    "weekday_pages": weekdayPages.joined(separator: ","),
+                    "weekday_seconds": String(weekdaySeconds),
+                    "weekend_pages": weekendPages.joined(separator: ","),
+                    "weekend_seconds": String(weekendSeconds),
+                 ],
                  completion: completion)
     }
 

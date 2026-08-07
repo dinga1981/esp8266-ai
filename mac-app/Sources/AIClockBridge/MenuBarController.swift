@@ -10,6 +10,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let usage: UsageFetcher
     private let port: UInt16
     private let market: MarketMonitor
+    private let weather: WeatherMonitor
     private let controlMenu = NSMenu()
     private let mirrorPopover: MirrorPopoverController
 
@@ -22,14 +23,15 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     init(service: StatusService, usage: UsageFetcher, netMonitor: NetSpeedMonitor,
          nowPlaying: NowPlayingMonitor, stockMonitor: StockMonitor,
-         market: MarketMonitor, port: UInt16) {
+         market: MarketMonitor, weather: WeatherMonitor, port: UInt16) {
         self.service = service
         self.usage = usage
         self.port = port
         self.market = market
+        self.weather = weather
         self.mirrorPopover = MirrorPopoverController(service: service, netMonitor: netMonitor,
                                                      nowPlaying: nowPlaying, stockMonitor: stockMonitor,
-                                                     market: market)
+                                                     market: market, weather: weather)
         super.init()
         buildMenu()
         if let button = statusItem.button {
@@ -85,10 +87,10 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(makeItem("打开设备网页", #selector(openDevicePage)))
 
         let displayMenu = NSMenu()
-        for (title, mode) in [("自动轮播（可配置）", "auto"), ("固定 Claude", "claude"),
-                              ("固定 Codex", "codex"), ("网速曲线", "net"),
-                              ("音乐播放", "music"), ("四行报价", "stock"),
-                              ("K线行情", "market")] {
+        for (title, mode) in [("自动轮播（按星期配置）", "auto"),
+                              ("固定 Codex", "codex"), ("音乐播放", "music"),
+                              ("四行报价", "stock"), ("K线行情", "market"),
+                              ("日期天气", "weather")] {
             let item = NSMenuItem(title: title, action: #selector(setDisplayMode(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = mode
@@ -98,10 +100,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         let displayItem = NSMenuItem(title: "屏幕显示", action: nil, keyEquivalent: "")
         displayItem.submenu = displayMenu
         menu.addItem(displayItem)
-        menu.addItem(makeItem("设置自动轮播页面与时间…", #selector(configureAutoCycle)))
+        menu.addItem(makeItem("设置工作日/周末自动轮播…", #selector(configureAutoCycle)))
         // (屏幕亮度在左键弹出的镜像页底部，做成滑条了)
 
         menu.addItem(makeItem("设置自选行情…", #selector(setStockSymbols)))
+        menu.addItem(makeItem("设置天气城市…", #selector(setWeatherCity)))
 
         let marketIntervalMenu = NSMenu()
         for interval in MarketInterval.allCases {
@@ -307,47 +310,79 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                 return
             }
             let pageOptions = [
-                ("claude", "Claude"), ("codex", "Codex"), ("net", "网速"),
-                ("music", "音乐"), ("stock", "四行报价"), ("market", "K线行情"),
+                ("codex", "Codex"), ("music", "音乐"), ("stock", "四行报价"),
+                ("market", "K线行情"), ("weather", "日期天气"),
             ]
             let stack = NSStackView()
             stack.orientation = .vertical
             stack.alignment = .leading
-            stack.spacing = 7
-            stack.setFrameSize(NSSize(width: 300, height: 210))
-            var checks: [(String, NSButton)] = []
-            for (id, title) in pageOptions {
-                let check = NSButton(checkboxWithTitle: title, target: nil, action: nil)
-                check.state = info.autoPages.contains(id) ? .on : .off
-                stack.addArrangedSubview(check)
-                checks.append((id, check))
-            }
-            let intervalRow = NSStackView()
-            intervalRow.orientation = .horizontal
-            intervalRow.spacing = 10
-            intervalRow.addArrangedSubview(NSTextField(labelWithString: "切换时间"))
-            let popup = NSPopUpButton()
+            stack.spacing = 9
+            stack.setFrameSize(NSSize(width: 430, height: 255))
             let intervals = [5, 10, 30, 60, 120]
-            popup.addItems(withTitles: intervals.map { "\($0) 秒" })
-            popup.selectItem(at: intervals.firstIndex(of: info.autoSeconds) ?? 1)
-            intervalRow.addArrangedSubview(popup)
-            stack.addArrangedSubview(intervalRow)
+
+            func makeSchedule(title: String, selected: [String], seconds: Int)
+                -> (NSView, [(String, NSButton)], NSPopUpButton) {
+                let group = NSStackView()
+                group.orientation = .vertical
+                group.alignment = .leading
+                group.spacing = 6
+                let heading = NSTextField(labelWithString: title)
+                heading.font = .boldSystemFont(ofSize: 13)
+                group.addArrangedSubview(heading)
+                let pages = NSStackView()
+                pages.orientation = .horizontal
+                pages.spacing = 9
+                var checks: [(String, NSButton)] = []
+                for (id, name) in pageOptions {
+                    let check = NSButton(checkboxWithTitle: name, target: nil, action: nil)
+                    check.state = selected.contains(id) ? .on : .off
+                    pages.addArrangedSubview(check)
+                    checks.append((id, check))
+                }
+                group.addArrangedSubview(pages)
+                let intervalRow = NSStackView()
+                intervalRow.orientation = .horizontal
+                intervalRow.spacing = 10
+                intervalRow.addArrangedSubview(NSTextField(labelWithString: "页面切换时间"))
+                let popup = NSPopUpButton()
+                popup.addItems(withTitles: intervals.map { "\($0) 秒" })
+                popup.selectItem(at: intervals.firstIndex(of: seconds) ?? 1)
+                intervalRow.addArrangedSubview(popup)
+                group.addArrangedSubview(intervalRow)
+                return (group, checks, popup)
+            }
+
+            let weekday = makeSchedule(title: "周一至周五", selected: info.weekdayAutoPages,
+                                       seconds: info.weekdayAutoSeconds)
+            let weekend = makeSchedule(title: "周六至周日", selected: info.weekendAutoPages,
+                                       seconds: info.weekendAutoSeconds)
+            stack.addArrangedSubview(weekday.0)
+            let separator = NSBox()
+            separator.boxType = .separator
+            separator.widthAnchor.constraint(equalToConstant: 430).isActive = true
+            stack.addArrangedSubview(separator)
+            stack.addArrangedSubview(weekend.0)
 
             let alert = NSAlert()
-            alert.messageText = "设置自动轮播"
-            alert.informativeText = "普通页面按设定时间切换；K线页会等待全部收藏完整展示一轮。至少选择一个页面。"
+            alert.messageText = "按星期设置自动轮播"
+            alert.informativeText = "两组可选择不同页面和时间；K线页仍会等待全部收藏完整展示一轮。"
             alert.accessoryView = stack
             alert.addButton(withTitle: "保存并切换到自动")
             alert.addButton(withTitle: "取消")
             NSApp.activate(ignoringOtherApps: true)
             guard alert.runModal() == .alertFirstButtonReturn else { return }
-            let pages = checks.filter { $0.1.state == .on }.map { $0.0 }
-            guard !pages.isEmpty else {
-                Self.toast("无法保存", "请至少选择一个轮播页面。")
+            let weekdayPages = weekday.1.filter { $0.1.state == .on }.map { $0.0 }
+            let weekendPages = weekend.1.filter { $0.1.state == .on }.map { $0.0 }
+            guard !weekdayPages.isEmpty, !weekendPages.isEmpty else {
+                Self.toast("无法保存", "工作日和周末都要至少选择一个轮播页面。")
                 return
             }
-            let seconds = intervals[max(0, popup.indexOfSelectedItem)]
-            DeviceClient.setAutoCycle(pages: pages, seconds: seconds) { error in
+            let weekdaySeconds = intervals[max(0, weekday.2.indexOfSelectedItem)]
+            let weekendSeconds = intervals[max(0, weekend.2.indexOfSelectedItem)]
+            DeviceClient.setAutoSchedule(weekdayPages: weekdayPages,
+                                         weekdaySeconds: weekdaySeconds,
+                                         weekendPages: weekendPages,
+                                         weekendSeconds: weekendSeconds) { error in
                 if let error {
                     Self.toast("保存失败", error.localizedDescription)
                 } else {
@@ -355,6 +390,27 @@ final class MenuBarController: NSObject, NSMenuDelegate {
                         if let modeError { Self.toast("切换失败", modeError.localizedDescription) }
                     }
                 }
+            }
+        }
+    }
+
+    @objc private func setWeatherCity() {
+        let alert = NSAlert()
+        alert.messageText = "设置天气城市"
+        alert.informativeText = "输入中文或英文城市名。保存后会自动匹配城市，并更新当地时间与天气。"
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        input.stringValue = weather.configuredCity
+        input.placeholderString = "例如：上海、杭州、Tokyo"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "查找并保存")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let city = input.stringValue
+        weather.setCity(city) { result in
+            switch result {
+            case let .success(detail): Self.toast("天气城市已更新", detail)
+            case let .failure(error): Self.toast("城市设置失败", error.localizedDescription)
             }
         }
     }
@@ -519,6 +575,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         case "music": return "音乐"
         case "stock": return "四行报价"
         case "market": return "K线行情"
+        case "weather": return "日期天气"
         default: return showing == "claude" ? "Claude" : "Codex"
         }
     }

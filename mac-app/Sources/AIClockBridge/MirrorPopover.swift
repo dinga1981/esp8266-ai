@@ -96,6 +96,8 @@ final class MirrorView: NSView {
     var stockRows: [StockMonitor.Row] = []
     var marketMode = false
     var marketFrame: CGImage?
+    var weatherMode = false
+    var weather = WeatherSnapshot()
     var netHeaderDL = "0B"
     var netHeaderUL = "0B"
     private static let netCols = 224 // NET_CHART_W
@@ -221,6 +223,11 @@ final class MirrorView: NSView {
                 ctx.draw(marketFrame, in: CGRect(x: 0, y: 0, width: 240, height: 240))
                 ctx.restoreGState()
             }
+            ctx.restoreGState()
+            return
+        }
+        if weatherMode {
+            drawWeatherScene(ctx)
             ctx.restoreGState()
             return
         }
@@ -633,6 +640,127 @@ final class MirrorView: NSView {
             ])
     }
 
+    private func drawWeatherScene(_ ctx: CGContext) {
+        let cyan = NSColor(calibratedRed: 0.49, green: 0.85, blue: 1, alpha: 1)
+        let muted = NSColor(calibratedRed: 0.60, green: 0.68, blue: 0.74, alpha: 1)
+        let warm = NSColor(calibratedRed: 1, green: 0.70, blue: 0.37, alpha: 1)
+        let cool = NSColor(calibratedRed: 0.46, green: 0.81, blue: 1, alpha: 1)
+        ctx.setFillColor(NSColor(calibratedRed: 0.06, green: 0.13, blue: 0.19, alpha: 1).cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: 240, height: 32))
+        ctx.setStrokeColor(NSColor(calibratedRed: 0.16, green: 0.28, blue: 0.37, alpha: 1).cgColor)
+        ctx.setLineWidth(1)
+        ctx.move(to: CGPoint(x: 0, y: 32)); ctx.addLine(to: CGPoint(x: 240, y: 32)); ctx.strokePath()
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: weather.timeZone)
+            ?? TimeZone(secondsFromGMT: weather.utcOffsetSeconds) ?? .current
+        let now = Date()
+        let month = calendar.component(.month, from: now)
+        let day = calendar.component(.day, from: now)
+        let weekdayNames = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+        let weekday = weekdayNames[max(1, calendar.component(.weekday, from: now)) - 1]
+        let dateText = String(format: "%02d/%02d %@", month, day, weekday)
+        let headerFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+        (weather.city as NSString).draw(at: NSPoint(x: 10, y: 9), withAttributes: [
+            .font: headerFont, .foregroundColor: cyan,
+        ])
+        let right = NSMutableParagraphStyle(); right.alignment = .right
+        (dateText as NSString).draw(in: NSRect(x: 108, y: 9, width: 122, height: 16), withAttributes: [
+            .font: headerFont, .foregroundColor: muted, .paragraphStyle: right,
+        ])
+
+        let parts = calendar.dateComponents([.hour, .minute, .second], from: now)
+        let clock = String(format: "%02d:%02d:%02d", parts.hour ?? 0, parts.minute ?? 0,
+                           parts.second ?? 0)
+        let center = NSMutableParagraphStyle(); center.alignment = .center
+        (clock as NSString).draw(in: NSRect(x: 0, y: 38, width: 240, height: 38), withAttributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 29, weight: .medium),
+            .foregroundColor: NSColor.white, .paragraphStyle: center,
+        ])
+
+        drawWeatherIcon(code: weather.currentCode, center: CGPoint(x: 70, y: 118), size: 54, ctx: ctx)
+        let current = weather.hasData ? "\(Int(weather.currentTemperature.rounded()))°C" : "--°C"
+        (current as NSString).draw(in: NSRect(x: 105, y: 92, width: 125, height: 45), withAttributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 34, weight: .medium),
+            .foregroundColor: NSColor.white,
+        ])
+        ((weather.hasData ? weather.currentText : "WAITING") as NSString).draw(
+            in: NSRect(x: 107, y: 133, width: 120, height: 20), withAttributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: cyan,
+            ])
+
+        ctx.setFillColor(NSColor(calibratedRed: 0.04, green: 0.08, blue: 0.12, alpha: 1).cgColor)
+        ctx.fill(CGRect(x: 0, y: 168, width: 240, height: 72))
+        ctx.setStrokeColor(NSColor(calibratedRed: 0.16, green: 0.28, blue: 0.37, alpha: 1).cgColor)
+        ctx.move(to: CGPoint(x: 0, y: 168)); ctx.addLine(to: CGPoint(x: 240, y: 168))
+        ctx.move(to: CGPoint(x: 120, y: 168)); ctx.addLine(to: CGPoint(x: 120, y: 240)); ctx.strokePath()
+
+        func drawDay(x: CGFloat, title: String, code: Int, text: String, high: Double, low: Double) {
+            drawWeatherIcon(code: code, center: CGPoint(x: x + 27, y: 203), size: 30, ctx: ctx)
+            ((title + " · " + text) as NSString).draw(in: NSRect(x: x + 50, y: 180, width: 67, height: 16),
+                withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 8, weight: .medium),
+                                 .foregroundColor: muted])
+            let hi = weather.hasData ? "\(Int(high.rounded()))°" : "--°"
+            let lo = weather.hasData ? "\(Int(low.rounded()))°" : "--°"
+            (hi as NSString).draw(at: NSPoint(x: x + 50, y: 204), withAttributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .medium),
+                .foregroundColor: warm,
+            ])
+            (("/ " + lo) as NSString).draw(at: NSPoint(x: x + 78, y: 204), withAttributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .medium),
+                .foregroundColor: cool,
+            ])
+        }
+        drawDay(x: 0, title: "TODAY", code: weather.todayCode, text: weather.todayText,
+                high: weather.todayHigh, low: weather.todayLow)
+        drawDay(x: 120, title: "TMRW", code: weather.tomorrowCode, text: weather.tomorrowText,
+                high: weather.tomorrowHigh, low: weather.tomorrowLow)
+    }
+
+    private func drawWeatherIcon(code: Int, center: CGPoint, size: CGFloat, ctx: CGContext) {
+        let yellow = NSColor(calibratedRed: 1, green: 0.78, blue: 0.24, alpha: 1)
+        let cloud = NSColor(calibratedRed: 0.72, green: 0.79, blue: 0.84, alpha: 1)
+        let rain = NSColor(calibratedRed: 0.33, green: 0.75, blue: 1, alpha: 1)
+        let isClear = code == 0
+        let hasSun = code <= 2
+        let hasRain = (51...67).contains(code) || (80...82).contains(code) || code >= 95
+        let hasSnow = (71...77).contains(code) || (85...86).contains(code)
+        if hasSun {
+            let r = size * (isClear ? 0.23 : 0.17)
+            ctx.setFillColor(yellow.cgColor)
+            ctx.fillEllipse(in: CGRect(x: center.x - r, y: center.y - r - (isClear ? 0 : size * 0.12),
+                                       width: r * 2, height: r * 2))
+            if isClear {
+                ctx.setStrokeColor(yellow.cgColor); ctx.setLineWidth(max(2, size * 0.05))
+                for i in 0..<8 {
+                    let angle = CGFloat(i) * .pi / 4
+                    ctx.move(to: CGPoint(x: center.x + cos(angle) * size * 0.33,
+                                         y: center.y + sin(angle) * size * 0.33))
+                    ctx.addLine(to: CGPoint(x: center.x + cos(angle) * size * 0.46,
+                                            y: center.y + sin(angle) * size * 0.46))
+                }
+                ctx.strokePath(); return
+            }
+        }
+        ctx.setFillColor(cloud.cgColor)
+        let y = center.y + size * 0.05
+        ctx.fillEllipse(in: CGRect(x: center.x - size * 0.36, y: y - size * 0.10,
+                                   width: size * 0.72, height: size * 0.30))
+        ctx.fillEllipse(in: CGRect(x: center.x - size * 0.23, y: y - size * 0.30,
+                                   width: size * 0.44, height: size * 0.42))
+        if hasRain || hasSnow {
+            ctx.setStrokeColor(rain.cgColor); ctx.setLineWidth(max(1.5, size * 0.04))
+            for dx in [-0.22, 0.0, 0.22] as [CGFloat] {
+                let x = center.x + dx * size
+                ctx.move(to: CGPoint(x: x, y: center.y + size * 0.27))
+                ctx.addLine(to: CGPoint(x: x - (hasSnow ? 0 : size * 0.06),
+                                        y: center.y + size * 0.42))
+            }
+            ctx.strokePath()
+        }
+    }
+
     /// Same compact unit strings the firmware prints ("2.3M", "480K").
     static func deviceSpeedText(_ bps: Double) -> String {
         if bps >= 1_000_000 { return String(format: "%.1fM", bps / 1_000_000) }
@@ -649,9 +777,10 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private let nowPlaying: NowPlayingMonitor
     private let stockMonitor: StockMonitor
     private let market: MarketMonitor
+    private let weather: WeatherMonitor
     private let popover = NSPopover()
     private let mirror = MirrorView()
-    private let modeControl = NSSegmentedControl(labels: ["自动", "Claude", "Codex", "网速", "音乐", "报价", "K线"],
+    private let modeControl = NSSegmentedControl(labels: ["自动", "Codex", "音乐", "报价", "K线", "天气"],
                                                  trackingMode: .selectOne, target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "连接设备中…")
     private let brightnessSlider = NSSlider(value: 100, minValue: 0, maxValue: 100,
@@ -670,12 +799,13 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var fetchingSlot: String?
 
     init(service: StatusService, netMonitor: NetSpeedMonitor, nowPlaying: NowPlayingMonitor,
-         stockMonitor: StockMonitor, market: MarketMonitor) {
+         stockMonitor: StockMonitor, market: MarketMonitor, weather: WeatherMonitor) {
         self.service = service
         self.netMonitor = netMonitor
         self.nowPlaying = nowPlaying
         self.stockMonitor = stockMonitor
         self.market = market
+        self.weather = weather
         super.init()
         popover.behavior = .transient
         popover.delegate = self
@@ -808,15 +938,16 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 self.applyScene(info)
                 self.ensureSprite(info)
                 self.syncBrightness(info)
-                let modeIdx = ["auto": 0, "claude": 1, "codex": 2, "net": 3,
-                               "music": 4, "stock": 5, "market": 6][info.mode] ?? 0
+                let modeIdx = ["auto": 0, "codex": 1, "music": 2, "stock": 3,
+                               "market": 4, "weather": 5][info.mode] ?? 0
                 self.modeControl.selectedSegment = modeIdx
                 let modeText = info.mode == "auto" ? "自动切换"
                     : info.mode == "net" ? "网速曲线"
                     : info.mode == "music" ? "音乐播放"
                     : info.mode == "stock" ? "四行报价"
                     : info.mode == "market" ? "K线行情" : "固定显示"
-                self.statusLabel.stringValue = "\(info.ip) · \(modeText) · 数据 \(info.bridge)"
+                let shownModeText = info.mode == "weather" ? "日期天气" : modeText
+                self.statusLabel.stringValue = "\(info.ip) · \(shownModeText) · 数据 \(info.bridge)"
             case .failure:
                 self.mirror.deviceOK = false
                 self.mirror.needsDisplay = true
@@ -844,6 +975,12 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
         mirror.musicMode = info.effective == "music"
         mirror.stockMode = info.effective == "stock"
         mirror.marketMode = info.effective == "market"
+        mirror.weatherMode = info.effective == "weather"
+        if mirror.weatherMode {
+            mirror.weather = weather.snapshot
+            mirror.needsDisplay = true
+            return
+        }
         if mirror.marketMode {
             mirror.marketFrame = decodeCover(market.frameRGB565, w: 240, h: 240)
             mirror.needsDisplay = true
@@ -942,7 +1079,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     private var flashCounter = 0
 
     private func animTick() {
-        guard let info = lastInfo, !mirror.netMode else { return }
+        guard let info = lastInfo, !mirror.netMode, !mirror.weatherMode else { return }
 
         if mirror.countdownKind != nil {
             mirror.needsDisplay = true
@@ -974,7 +1111,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func modeChanged() {
-        let mode = ["auto", "claude", "codex", "net", "music", "stock", "market"][max(0, modeControl.selectedSegment)]
+        let mode = ["auto", "codex", "music", "stock", "market", "weather"][max(0, modeControl.selectedSegment)]
         DeviceClient.setDisplayMode(mode) { [weak self] _ in self?.tick() }
     }
 }

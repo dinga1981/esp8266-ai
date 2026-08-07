@@ -47,10 +47,13 @@ let stockMonitor = StockMonitor()
 stockMonitor.start()
 let marketMonitor = MarketMonitor()
 marketMonitor.start()
+let weatherMonitor = WeatherMonitor()
+weatherMonitor.start()
 
 // Wired fallback: if the clock is plugged in over USB, push status/net down
 // the serial line (works around AP client isolation; no WiFi setup needed).
-let serialLink = SerialLink(service: service, netMonitor: netMonitor, stockMonitor: stockMonitor)
+let serialLink = SerialLink(service: service, netMonitor: netMonitor, stockMonitor: stockMonitor,
+                            weatherMonitor: weatherMonitor)
 serialLink.start()
 
 let server = HTTPServer(port: port, routes: [
@@ -64,6 +67,7 @@ let server = HTTPServer(port: port, routes: [
     "/stock": { stockMonitor.jsonData() },
     "/market": { marketMonitor.jsonData() },
     "/market/version": { marketMonitor.frameVersionJSON },
+    "/weather": { weatherMonitor.jsonData() },
 ], binaryRoutes: [
     "/music/cover.raw": { nowPlaying.coverRGB565 },
     "/music/text.raw": { nowPlaying.textRGB565 },
@@ -110,7 +114,7 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let menuBar = MenuBarController(service: service, usage: usage, netMonitor: netMonitor,
                                 nowPlaying: nowPlaying, stockMonitor: stockMonitor,
-                                market: marketMonitor, port: port)
+                                market: marketMonitor, weather: weatherMonitor, port: port)
 _ = menuBar // retain
 usage.startAutoRefresh()
 app.run()
