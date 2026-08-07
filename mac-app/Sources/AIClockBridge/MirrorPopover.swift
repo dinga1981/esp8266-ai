@@ -67,6 +67,11 @@ private func decodeCover(_ data: Data, w: Int, h: Int) -> CGImage? {
 // MARK: - the 240x240 replica view
 
 final class MirrorView: NSView {
+    enum CountdownKind {
+        case fiveHour
+        case weekly
+    }
+
     // scene state, all in the device's 240x240 logical coordinates
     var frames: [CGImage] = []
     var frameIdx = 0
@@ -74,8 +79,11 @@ final class MirrorView: NSView {
     var ringPct: Double = 0
     var needsInput = false // shown app waiting on approval -> red border flash
     var flashOn = false
-    var line1 = "5h -"
-    var line2 = "Weekly -"
+    var hourPct: Double?
+    var weekPct: Double?
+    var weeklyResetMin: Int?
+    private(set) var countdownKind: CountdownKind?
+    private var countdownDeadline: Date?
     var showingClaude = true
     var deviceOK = false
     // net-mode mirror: same scrolling area-chart model as the firmware —
@@ -122,6 +130,57 @@ final class MirrorView: NSView {
 
     private static let claudeLogo = Bundle.module.image(forResource: "claude-logo")
     private static let codexLogo = Bundle.module.image(forResource: "codex-logo")
+
+    private struct DotGlyph {
+        let width: Int
+        let rows: [UInt8]
+    }
+
+    // Same 5x7 cells used by firmware/src/main.cpp. Only glyphs used by the
+    // quota page are needed here; lower-case letters otherwise fall back to
+    // their upper-case form, just like the firmware.
+    private static let dotGlyphs: [Character: DotGlyph] = [
+        "0": DotGlyph(width: 5, rows: [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110]),
+        "1": DotGlyph(width: 5, rows: [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
+        "2": DotGlyph(width: 5, rows: [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111]),
+        "3": DotGlyph(width: 5, rows: [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110]),
+        "4": DotGlyph(width: 5, rows: [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010]),
+        "5": DotGlyph(width: 5, rows: [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110]),
+        "6": DotGlyph(width: 5, rows: [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110]),
+        "7": DotGlyph(width: 5, rows: [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000]),
+        "8": DotGlyph(width: 5, rows: [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110]),
+        "9": DotGlyph(width: 5, rows: [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100]),
+        "E": DotGlyph(width: 5, rows: [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111]),
+        "H": DotGlyph(width: 5, rows: [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
+        "I": DotGlyph(width: 3, rows: [0b111, 0b010, 0b010, 0b010, 0b010, 0b010, 0b111]),
+        "K": DotGlyph(width: 5, rows: [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001]),
+        "N": DotGlyph(width: 5, rows: [0b10001, 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001]),
+        "R": DotGlyph(width: 5, rows: [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001]),
+        "S": DotGlyph(width: 5, rows: [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110]),
+        "T": DotGlyph(width: 5, rows: [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]),
+        "W": DotGlyph(width: 5, rows: [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010]),
+        "d": DotGlyph(width: 5, rows: [0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10011, 0b01101]),
+        "h": DotGlyph(width: 5, rows: [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001]),
+        "k": DotGlyph(width: 5, rows: [0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010]),
+        "%": DotGlyph(width: 5, rows: [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011]),
+        ":": DotGlyph(width: 1, rows: [0, 0, 1, 0, 1, 0, 0]),
+        "-": DotGlyph(width: 3, rows: [0, 0, 0, 0b111, 0, 0, 0]),
+        " ": DotGlyph(width: 2, rows: [0, 0, 0, 0, 0, 0, 0]),
+    ]
+
+    func syncCountdown(kind: CountdownKind?, resetMin: Int?) {
+        guard let kind, let resetMin, resetMin >= 0 else {
+            countdownKind = nil
+            countdownDeadline = nil
+            return
+        }
+        let bridgeSeconds = Double(resetMin * 60 + 30)
+        let remaining = countdownDeadline?.timeIntervalSinceNow ?? -1
+        if countdownKind != kind || remaining < 0 || abs(remaining - bridgeSeconds) > 90 {
+            countdownDeadline = Date().addingTimeInterval(bridgeSeconds)
+        }
+        countdownKind = kind
+    }
 
     override var isFlipped: Bool { true } // draw in the panel's top-left origin
 
@@ -186,8 +245,9 @@ final class MirrorView: NSView {
         seg = min(remaining, side)
         if seg > 0 { NSRect(x: x0, y: 240 - m - seg, width: t, height: seg).fill() }     // left
 
-        // sprite, centered, pixel-crisp
-        if !frames.isEmpty {
+        // sprite, centered, pixel-crisp. The firmware replaces it with a
+        // reset countdown when either quota window is exhausted.
+        if countdownKind == nil, !frames.isEmpty {
             let img = frames[min(frameIdx, frames.count - 1)]
             let rect = CGRect(x: 120 - spriteW / 2, y: 120 - spriteH / 2,
                               width: spriteW, height: spriteH)
@@ -206,18 +266,13 @@ final class MirrorView: NSView {
             (showingClaude ? logo : logo2).draw(in: NSRect(x: 14, y: 18, width: 40, height: 40))
         }
 
-        // quota text
-        let style = NSMutableParagraphStyle()
-        style.alignment = .center
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold),
-            .foregroundColor: NSColor.white,
-            .paragraphStyle: style,
-        ]
-        (line1 as NSString).draw(in: NSRect(x: 0, y: 188, width: 240, height: 18), withAttributes: attrs)
-        (line2 as NSString).draw(in: NSRect(x: 0, y: 206, width: 240, height: 18), withAttributes: attrs)
+        drawQuotaText(ctx)
+        drawResetDays(ctx)
+        if countdownKind != nil { drawCountdown(ctx) }
 
         if !deviceOK {
+            let style = NSMutableParagraphStyle()
+            style.alignment = .center
             let overlay: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 14, weight: .bold),
                 .foregroundColor: NSColor.systemRed,
@@ -237,6 +292,147 @@ final class MirrorView: NSView {
             NSRect(x: 240 - m - t, y: m, width: t, height: side).fill()
         }
         ctx.restoreGState()
+    }
+
+    private static func glyph(_ c: Character) -> DotGlyph? {
+        if let glyph = dotGlyphs[c] { return glyph }
+        let upper = Character(String(c).uppercased())
+        return dotGlyphs[upper]
+    }
+
+    private static func dotAdvance(_ c: Character, pitch: Int, radius: Int) -> Int {
+        let width = glyph(c)?.width ?? 3
+        return (width - 1) * pitch + 2 * radius + 1 + pitch
+    }
+
+    private static func dotTextWidth(_ text: String, pitch: Int, radius: Int) -> Int {
+        guard !text.isEmpty else { return 0 }
+        return text.reduce(0) { $0 + dotAdvance($1, pitch: pitch, radius: radius) } - pitch
+    }
+
+    private static func squareAdvance(_ c: Character, pitch: Int, diameter: Int) -> Int {
+        let width = glyph(c)?.width ?? 3
+        return (width - 1) * pitch + diameter + pitch
+    }
+
+    private static func squareTextWidth(_ text: String, pitch: Int, diameter: Int) -> Int {
+        guard !text.isEmpty else { return 0 }
+        return text.reduce(0) { $0 + squareAdvance($1, pitch: pitch, diameter: diameter) } - pitch
+    }
+
+    private func drawDotText(_ text: String, centerX: Int, y: Int, pitch: Int,
+                             radius: Int, color: NSColor, context: CGContext) {
+        var x = centerX - Self.dotTextWidth(text, pitch: pitch, radius: radius) / 2
+        context.setFillColor(color.cgColor)
+        for c in text {
+            if let glyph = Self.glyph(c) {
+                for row in 0..<7 {
+                    for column in 0..<glyph.width
+                    where glyph.rows[row] & (1 << (glyph.width - 1 - column)) != 0 {
+                        let px = x + radius + column * pitch
+                        let py = y + radius + row * pitch
+                        if radius == 0 {
+                            context.fill(CGRect(x: px, y: py, width: 1, height: 1))
+                        } else {
+                            let diameter = 2 * radius + 1
+                            context.fillEllipse(in: CGRect(x: px - radius, y: py - radius,
+                                                          width: diameter, height: diameter))
+                        }
+                    }
+                }
+            }
+            x += Self.dotAdvance(c, pitch: pitch, radius: radius)
+        }
+    }
+
+    private func drawSquareText(_ text: String, centerX: Int, y: Int, pitch: Int,
+                                diameter: Int, color: NSColor, context: CGContext) {
+        var x = centerX - Self.squareTextWidth(text, pitch: pitch, diameter: diameter) / 2
+        context.setFillColor(color.cgColor)
+        for c in text {
+            if let glyph = Self.glyph(c) {
+                for row in 0..<7 {
+                    for column in 0..<glyph.width
+                    where glyph.rows[row] & (1 << (glyph.width - 1 - column)) != 0 {
+                        context.fill(CGRect(x: x + column * pitch, y: y + row * pitch,
+                                            width: diameter, height: diameter))
+                    }
+                }
+            }
+            x += Self.squareAdvance(c, pitch: pitch, diameter: diameter)
+        }
+    }
+
+    private func drawQuotaText(_ context: CGContext) {
+        let grey = NSColor(calibratedWhite: 0.83, alpha: 1)
+        let hourText = Self.pctText(hourPct)
+        let weekText = Self.pctText(weekPct)
+        if hourPct == nil, weekPct != nil {
+            drawSquareText("Wk", centerX: 120, y: 183, pitch: 2, diameter: 2,
+                           color: grey, context: context)
+            drawDotText(weekText, centerX: 120, y: 199, pitch: 3, radius: 1,
+                        color: .white, context: context)
+        } else {
+            drawSquareText("5h", centerX: 70, y: 183, pitch: 2, diameter: 2,
+                           color: grey, context: context)
+            drawSquareText("Wk", centerX: 170, y: 183, pitch: 2, diameter: 2,
+                           color: grey, context: context)
+            drawDotText(hourText, centerX: 70, y: 199, pitch: 3, radius: 1,
+                        color: .white, context: context)
+            drawDotText(weekText, centerX: 170, y: 199, pitch: 3, radius: 1,
+                        color: .white, context: context)
+        }
+    }
+
+    private static func pctText(_ pct: Double?) -> String {
+        guard let pct, pct >= 0 else { return "-" }
+        return "\(Int(pct))%"
+    }
+
+    private func drawResetDays(_ context: CGContext) {
+        guard let minutes = weeklyResetMin, minutes >= 0 else { return }
+        let text = minutes < 1440 ? "\((minutes + 59) / 60)h" : "\((minutes + 1439) / 1440)d"
+        let tiny: [Character: [UInt8]] = [
+            "R": [0b110, 0b101, 0b110, 0b101, 0b101],
+            "E": [0b111, 0b100, 0b110, 0b100, 0b111],
+            "S": [0b011, 0b100, 0b010, 0b001, 0b110],
+            "T": [0b111, 0b010, 0b010, 0b010, 0b010],
+        ]
+        let label = "RESET"
+        var x = 198 - (label.count * 6 + (label.count - 1) * 2) / 2
+        context.setFillColor(NSColor(calibratedWhite: 0.83, alpha: 1).cgColor)
+        for c in label {
+            if let rows = tiny[c] {
+                for row in 0..<5 {
+                    for column in 0..<3 where rows[row] & (0b100 >> column) != 0 {
+                        context.fill(CGRect(x: x + column * 2, y: 18 + row * 2,
+                                            width: 2, height: 2))
+                    }
+                }
+            }
+            x += 8
+        }
+        drawDotText(text, centerX: 198, y: 33, pitch: text.count <= 2 ? 4 : 3,
+                    radius: 1, color: .white, context: context)
+    }
+
+    private func drawCountdown(_ context: CGContext) {
+        guard let kind = countdownKind else { return }
+        let remaining = max(0, Int(countdownDeadline?.timeIntervalSinceNow ?? 0))
+        let hours = remaining / 3600
+        let text: String
+        if hours >= 100 {
+            text = String(format: "%d:%02d", hours, (remaining % 3600) / 60)
+        } else {
+            text = String(format: "%d:%02d:%02d", hours, (remaining % 3600) / 60,
+                          remaining % 60)
+        }
+        drawDotText(kind == .weekly ? "Wk RESET IN" : "5h RESET IN",
+                    centerX: 120, y: 72, pitch: 2, radius: 0,
+                    color: NSColor(calibratedWhite: 0.83, alpha: 1), context: context)
+        drawDotText(text, centerX: 120, y: 100, pitch: 6, radius: 2,
+                    color: NSColor(calibratedRed: 1, green: 0.71, blue: 0, alpha: 1),
+                    context: context)
     }
 
     private func drawMusicScene(_ ctx: CGContext) {
@@ -681,28 +877,37 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
                 ?? (snap.claude.sessionWindowMin > 0
                     ? 100.0 * Double(snap.claude.sessionMin) / Double(snap.claude.sessionWindowMin) : 0)
             mirror.ringPct = pct
-            mirror.line1 = "5h " + Self.pctText(pct)
-            mirror.line2 = "Weekly " + Self.pctText(snap.claude.sevenDayPct)
+            mirror.hourPct = pct
+            mirror.weekPct = snap.claude.sevenDayPct
+            mirror.weeklyResetMin = snap.claude.sevenDayResetMin
+            if let weekly = snap.claude.sevenDayPct,
+               weekly >= 99.9, snap.claude.sevenDayResetMin != nil {
+                mirror.syncCountdown(kind: .weekly, resetMin: snap.claude.sevenDayResetMin)
+            } else if pct >= 99.9, snap.claude.fiveHourResetMin != nil {
+                mirror.syncCountdown(kind: .fiveHour, resetMin: snap.claude.fiveHourResetMin)
+            } else {
+                mirror.syncCountdown(kind: nil, resetMin: nil)
+            }
             mirror.needsInput = snap.claude.needsInput
         } else {
             // Codex may only have a weekly window now (5h limit dropped):
             // ring + single line follow whatever windows actually exist.
             mirror.ringPct = snap.codex.primaryPct ?? snap.codex.weeklyPct ?? 0
-            if snap.codex.primaryPct == nil, snap.codex.weeklyPct != nil {
-                mirror.line1 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
-                mirror.line2 = ""
+            mirror.hourPct = snap.codex.primaryPct
+            mirror.weekPct = snap.codex.weeklyPct
+            mirror.weeklyResetMin = snap.codex.weeklyResetMin
+            if let weekly = snap.codex.weeklyPct,
+               weekly >= 99.9, snap.codex.weeklyResetMin != nil {
+                mirror.syncCountdown(kind: .weekly, resetMin: snap.codex.weeklyResetMin)
+            } else if let primary = snap.codex.primaryPct,
+                      primary >= 99.9, snap.codex.primaryResetMin != nil {
+                mirror.syncCountdown(kind: .fiveHour, resetMin: snap.codex.primaryResetMin)
             } else {
-                mirror.line1 = "5h " + Self.pctText(snap.codex.primaryPct)
-                mirror.line2 = "Weekly " + Self.pctText(snap.codex.weeklyPct)
+                mirror.syncCountdown(kind: nil, resetMin: nil)
             }
             mirror.needsInput = snap.codex.needsInput
         }
         mirror.needsDisplay = true
-    }
-
-    private static func pctText(_ pct: Double?) -> String {
-        guard let p = pct, p >= 0 else { return "-" }
-        return "\(Int(p))%"
     }
 
     private func ensureSprite(_ info: DeviceInfo) {
@@ -738,6 +943,10 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
 
     private func animTick() {
         guard let info = lastInfo, !mirror.netMode else { return }
+
+        if mirror.countdownKind != nil {
+            mirror.needsDisplay = true
+        }
 
         // ~400ms red-border flash while an approval is pending (device cadence)
         if mirror.needsInput {
