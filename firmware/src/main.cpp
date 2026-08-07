@@ -520,12 +520,171 @@ const int QUOTA_LABEL_Y = 183, QUOTA_VALUE_Y = 199;
 const int QUOTA_COL1_X = 70, QUOTA_COL2_X = 170;
 String lastQuota5h, lastQuotaWk;
 
-// Faux-bold: the packed TFT_eSPI fonts have no bold face, so draw twice with
-// a 1px x offset. Transparent draws - the caller must have cleared the region.
-void drawBoldString(const String &s, int x, int y, int font, uint16_t color) {
-  tft.setTextColor(color);
-  tft.drawString(s, x, y, font);
-  tft.drawString(s, x + 1, y, font);
+// pushImage() colors must be pre-byte-swapped (this firmware never enables
+// setSwapBytes; see the sprite pipeline). Natural RGB565 -> wire order:
+inline uint16_t swap565(uint16_t c) { return (uint16_t)((c << 8) | (c >> 8)); }
+
+// ---- Nothing-phone-style dot-matrix font (NDot look) ----
+// Every piece of ASCII text on the Claude/Codex quota pages renders as round
+// dots on a fixed grid with visible gaps.
+struct DotGlyph {
+  char c;
+  uint8_t w;
+  uint8_t rows[7];
+};
+
+const DotGlyph dotGlyphs[] = {
+    {'0', 5, {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110}},
+    {'1', 5, {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110}},
+    {'2', 5, {0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111}},
+    {'3', 5, {0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110}},
+    {'4', 5, {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010}},
+    {'5', 5, {0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110}},
+    {'6', 5, {0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110}},
+    {'7', 5, {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000}},
+    {'8', 5, {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110}},
+    {'9', 5, {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100}},
+    {'A', 5, {0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001}},
+    {'B', 5, {0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110}},
+    {'C', 5, {0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110}},
+    {'D', 5, {0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110}},
+    {'E', 5, {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111}},
+    {'F', 5, {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000}},
+    {'G', 5, {0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111}},
+    {'H', 5, {0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001}},
+    {'I', 3, {0b111, 0b010, 0b010, 0b010, 0b010, 0b010, 0b111}},
+    {'J', 5, {0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100}},
+    {'K', 5, {0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001}},
+    {'L', 5, {0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111}},
+    {'M', 5, {0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001}},
+    {'N', 5, {0b10001, 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001}},
+    {'O', 5, {0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110}},
+    {'P', 5, {0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000}},
+    {'Q', 5, {0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101}},
+    {'R', 5, {0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001}},
+    {'S', 5, {0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110}},
+    {'T', 5, {0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100}},
+    {'U', 5, {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110}},
+    {'V', 5, {0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100}},
+    {'W', 5, {0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010}},
+    {'X', 5, {0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001}},
+    {'Y', 5, {0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100}},
+    {'Z', 5, {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111}},
+    {'d', 5, {0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10011, 0b01101}},
+    {'h', 5, {0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001}},
+    {'k', 5, {0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010}},
+    {'s', 5, {0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110}},
+    {'%', 5, {0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011}},
+    {':', 1, {0b0, 0b0, 0b1, 0b0, 0b1, 0b0, 0b0}},
+    {'.', 1, {0b0, 0b0, 0b0, 0b0, 0b0, 0b0, 0b1}},
+    {',', 1, {0b0, 0b0, 0b0, 0b0, 0b0, 0b1, 0b1}},
+    {'\'', 1, {0b1, 0b1, 0b0, 0b0, 0b0, 0b0, 0b0}},
+    {'!', 1, {0b1, 0b1, 0b1, 0b1, 0b1, 0b0, 0b1}},
+    {'?', 5, {0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100}},
+    {'-', 3, {0b000, 0b000, 0b000, 0b111, 0b000, 0b000, 0b000}},
+    {'+', 3, {0b000, 0b010, 0b010, 0b111, 0b010, 0b010, 0b000}},
+    {'/', 3, {0b001, 0b001, 0b010, 0b010, 0b010, 0b100, 0b100}},
+    {' ', 2, {0b0, 0b0, 0b0, 0b0, 0b0, 0b0, 0b0}},
+};
+
+const DotGlyph *dotGlyph(char c) {
+  for (const DotGlyph &g : dotGlyphs)
+    if (g.c == c) return &g;
+  if (c >= 'a' && c <= 'z') return dotGlyph(c - 32);
+  return nullptr;
+}
+
+int dotCharAdv(char c, int pitch, int r) {
+  const DotGlyph *g = dotGlyph(c);
+  int w = g ? g->w : 3;
+  return (w - 1) * pitch + 2 * r + 1 + pitch;
+}
+
+int dotTextWidth(const String &s, int pitch, int r) {
+  if (s.length() == 0) return 0;
+  int w = 0;
+  for (unsigned int i = 0; i < s.length(); i++) w += dotCharAdv(s[i], pitch, r);
+  return w - pitch;
+}
+
+int dotTextHeight(int pitch, int r) { return 6 * pitch + 2 * r + 1; }
+
+void drawDotChar(char c, int x, int y, int pitch, int r, uint16_t color) {
+  const DotGlyph *g = dotGlyph(c);
+  if (!g) return;
+  for (int ry = 0; ry < 7; ry++)
+    for (int cx = 0; cx < g->w; cx++)
+      if (g->rows[ry] & (1 << (g->w - 1 - cx))) {
+        if (r <= 0) tft.drawPixel(x + r + cx * pitch, y + r + ry * pitch, color);
+        else tft.fillCircle(x + r + cx * pitch, y + r + ry * pitch, r, color);
+      }
+}
+
+void drawDotText(const String &s, int x, int y, int pitch, int r, uint16_t color) {
+  for (unsigned int i = 0; i < s.length(); i++) {
+    drawDotChar(s[i], x, y, pitch, r, color);
+    x += dotCharAdv(s[i], pitch, r);
+  }
+}
+
+void drawDotTextC(const String &s, int cx, int y, int pitch, int r, uint16_t color) {
+  drawDotText(s, cx - dotTextWidth(s, pitch, r) / 2, y, pitch, r, color);
+}
+
+int sqCharAdv(char c, int pitch, int d) {
+  const DotGlyph *g = dotGlyph(c);
+  int w = g ? g->w : 3;
+  return (w - 1) * pitch + d + pitch;
+}
+
+int sqTextWidth(const String &s, int pitch, int d) {
+  if (s.length() == 0) return 0;
+  int w = 0;
+  for (unsigned int i = 0; i < s.length(); i++) w += sqCharAdv(s[i], pitch, d);
+  return w - pitch;
+}
+
+void drawSqText(const String &s, int x, int y, int pitch, int d, uint16_t color) {
+  for (unsigned int i = 0; i < s.length(); i++) {
+    const DotGlyph *g = dotGlyph(s[i]);
+    if (g)
+      for (int ry = 0; ry < 7; ry++)
+        for (int cx = 0; cx < g->w; cx++)
+          if (g->rows[ry] & (1 << (g->w - 1 - cx)))
+            tft.fillRect(x + cx * pitch, y + ry * pitch, d, d, color);
+    x += sqCharAdv(s[i], pitch, d);
+  }
+}
+
+void drawSqTextC(const String &s, int cx, int y, int pitch, int d, uint16_t color) {
+  drawSqText(s, cx - sqTextWidth(s, pitch, d) / 2, y, pitch, d, color);
+}
+
+struct TinyGlyph {
+  char c;
+  uint8_t rows[5];
+};
+
+const TinyGlyph tinyGlyphs[] = {
+    {'R', {0b110, 0b101, 0b110, 0b101, 0b101}},
+    {'E', {0b111, 0b100, 0b110, 0b100, 0b111}},
+    {'S', {0b011, 0b100, 0b010, 0b001, 0b110}},
+    {'T', {0b111, 0b010, 0b010, 0b010, 0b010}},
+};
+
+void drawTinyBoldText(const String &s, int cx, int y, uint16_t color) {
+  const int P = 2, D = 2;
+  int x = cx - ((int)s.length() * (2 * P + D) + ((int)s.length() - 1) * 2) / 2;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    for (const TinyGlyph &g : tinyGlyphs)
+      if (g.c == s[i]) {
+        for (int ry = 0; ry < 5; ry++)
+          for (int gx = 0; gx < 3; gx++)
+            if (g.rows[ry] & (0b100 >> gx)) tft.fillRect(x + gx * P, y + ry * P, D, D, color);
+        break;
+      }
+    x += 2 * P + D + 2;
+  }
 }
 
 void drawQuotaText(float hourPct, float weekPct, bool force) {
@@ -536,34 +695,33 @@ void drawQuotaText(float hourPct, float weekPct, bool force) {
   if ((int8_t)single != lastSingle) {
     lastSingle = (int8_t)single;
     force = true;
-    tft.fillRect(0, QUOTA_LABEL_Y, 240, QUOTA_VALUE_Y + 26 - QUOTA_LABEL_Y, TFT_BLACK);
+    tft.fillRect(0, QUOTA_LABEL_Y, 240, QUOTA_VALUE_Y + 22 - QUOTA_LABEL_Y, TFT_BLACK);
   }
-  tft.setTextDatum(TC_DATUM);
   if (single) {
-    if (force) drawBoldString("Wk", 120, QUOTA_LABEL_Y, 2, TFT_LIGHTGREY);
+    if (force) drawSqTextC("Wk", 120, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
     String v = pctText(weekPct);
     if (force || v != lastQuotaWk) {
       lastQuotaWk = v;
       lastQuota5h = "";
-      tft.fillRect(120 - 50, QUOTA_VALUE_Y, 100, 26, TFT_BLACK);
-      drawBoldString(v, 120, QUOTA_VALUE_Y, 4, TFT_WHITE);
+      tft.fillRect(120 - 50, QUOTA_VALUE_Y, 100, 22, TFT_BLACK);
+      drawDotTextC(v, 120, QUOTA_VALUE_Y, 3, 1, TFT_WHITE);
     }
     return;
   }
   if (force) {
-    drawBoldString("5h", QUOTA_COL1_X, QUOTA_LABEL_Y, 2, TFT_LIGHTGREY);
-    drawBoldString("Wk", QUOTA_COL2_X, QUOTA_LABEL_Y, 2, TFT_LIGHTGREY);
+    drawSqTextC("5h", QUOTA_COL1_X, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
+    drawSqTextC("Wk", QUOTA_COL2_X, QUOTA_LABEL_Y, 2, 2, TFT_LIGHTGREY);
   }
   String v1 = pctText(hourPct), v2 = pctText(weekPct);
   if (force || v1 != lastQuota5h) {
     lastQuota5h = v1;
-    tft.fillRect(QUOTA_COL1_X - 50, QUOTA_VALUE_Y, 100, 26, TFT_BLACK);
-    drawBoldString(v1, QUOTA_COL1_X, QUOTA_VALUE_Y, 4, TFT_WHITE);
+    tft.fillRect(QUOTA_COL1_X - 50, QUOTA_VALUE_Y, 100, 22, TFT_BLACK);
+    drawDotTextC(v1, QUOTA_COL1_X, QUOTA_VALUE_Y, 3, 1, TFT_WHITE);
   }
   if (force || v2 != lastQuotaWk) {
     lastQuotaWk = v2;
-    tft.fillRect(QUOTA_COL2_X - 50, QUOTA_VALUE_Y, 100, 26, TFT_BLACK);
-    drawBoldString(v2, QUOTA_COL2_X, QUOTA_VALUE_Y, 4, TFT_WHITE);
+    tft.fillRect(QUOTA_COL2_X - 50, QUOTA_VALUE_Y, 100, 22, TFT_BLACK);
+    drawDotTextC(v2, QUOTA_COL2_X, QUOTA_VALUE_Y, 3, 1, TFT_WHITE);
   }
 }
 
@@ -636,20 +794,28 @@ void drawCountdown(bool force) {
     snprintf(buf, sizeof(buf), "%ld:%02ld:%02ld", hours, (remain % 3600) / 60, remain % 60);
   String t(buf);
   if (!force && t == lastCountdown) return;
-  // in-place glyph overwrite can't erase a shrinking string (h:mm:ss width is
-  // constant, but 100:00 -> 99:59:59 changes layout once) - clear on any
-  // length change
+  // A length change shifts every glyph cell, so clear the whole region.
   if (t.length() != lastCountdown.length()) force = true;
-  lastCountdown = t;
-  tft.setTextDatum(TC_DATUM);
+  const int P = 6, R = 2, VAL_Y = 100;
+  int x = SCREEN_CX - dotTextWidth(t, P, R) / 2;
   if (force) {
     tft.fillRect(SCREEN_CX - 99, 66, 198, 84, TFT_BLACK);
-    drawBoldString(showingCd == CD_WEEK ? "Wk RESET IN" : "5h RESET IN", SCREEN_CX, 72, 2, TFT_LIGHTGREY);
+    drawDotTextC(showingCd == CD_WEEK ? "Wk RESET IN" : "5h RESET IN", SCREEN_CX, 72, 2, 0,
+                 TFT_LIGHTGREY);
+    drawDotText(t, x, VAL_Y, P, R, TFT_ORANGE);
+  } else {
+    // Same length keeps identical cell positions, so repaint only digits that
+    // changed and avoid a once-per-second full-row flash.
+    for (unsigned int i = 0; i < t.length(); i++) {
+      int adv = dotCharAdv(t[i], P, R);
+      if (t[i] != lastCountdown[i]) {
+        tft.fillRect(x, VAL_Y, adv - P, dotTextHeight(P, R), TFT_BLACK);
+        drawDotChar(t[i], x, VAL_Y, P, R, TFT_ORANGE);
+      }
+      x += adv;
+    }
   }
-  // Background-color draw overwrites glyphs in place (no clear-then-draw
-  // flash between seconds).
-  tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-  tft.drawString(t, SCREEN_CX, 102, 6);
+  lastCountdown = t;
 }
 
 // App logo in the top-left corner (inside the quota ring) so a glance tells
@@ -665,6 +831,28 @@ void drawAppLogo() {
     memcpy_P(rowBuf, logo + (size_t)r * w, (size_t)w * 2);
     tft.pushImage(LOGO_X, LOGO_Y + r, w, 1, rowBuf);
   }
+}
+
+// Days until the weekly quota resets, shown opposite the app logo. Below one
+// day the readout changes to hours.
+const int RESET_CX = 198, RESET_LABEL_Y = 18, RESET_VALUE_Y = 33;
+String lastResetDays;
+
+String resetDaysText(int min) {
+  if (min < 0) return "";
+  if (min < 1440) return String((min + 59) / 60) + "h";
+  return String((min + 1439) / 1440) + "d";
+}
+
+void drawResetDays(bool force) {
+  String t = resetDaysText(currentWeekResetMin());
+  if (!force && t == lastResetDays) return;
+  lastResetDays = t;
+  tft.fillRect(RESET_CX - 32, RESET_LABEL_Y, 60, RESET_VALUE_Y + 27 - RESET_LABEL_Y, TFT_BLACK);
+  if (t.length() == 0) return;
+  drawTinyBoldText("RESET", RESET_CX, RESET_LABEL_Y, TFT_LIGHTGREY);
+  int pitch = t.length() <= 2 ? 4 : 3;
+  drawDotTextC(t, RESET_CX, RESET_VALUE_Y, pitch, 1, TFT_WHITE);
 }
 
 // Codex's ring percentage: the 5h window when it exists, otherwise the
@@ -704,6 +892,7 @@ void drawActiveApp() {
   }
   if (showingCd != CD_NONE) drawCountdown(true);
   drawAppLogo();
+  drawResetDays(true);
 }
 
 // In-place refresh after a bridge poll: ring repaint + only the text that
@@ -720,6 +909,7 @@ void refreshActiveApp() {
     drawSquareRing(codexRingPct(), currentStatusColor());
     drawQuotaText(codexStatus.primaryPct, codexStatus.weeklyPct, false);
   }
+  drawResetDays(false);
   if (showingCd != CD_NONE) {
     syncCountdownDeadline();
     drawCountdown(false);
@@ -785,10 +975,6 @@ String speedText(long bps) {
   else snprintf(buf, sizeof(buf), "%ldB", bps);
   return String(buf);
 }
-
-// pushImage() colors must be pre-byte-swapped (this firmware never enables
-// setSwapBytes; see the sprite pipeline). Natural RGB565 -> wire order:
-inline uint16_t swap565(uint16_t c) { return (uint16_t)((c << 8) | (c >> 8)); }
 
 void resetNetChart() {
   memset(netHistRx, 0, sizeof(netHistRx));
