@@ -318,7 +318,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             stack.alignment = .leading
             stack.spacing = 9
             stack.setFrameSize(NSSize(width: 430, height: 255))
-            let intervals = [5, 10, 30, 60, 120]
+            let intervals = [5, 10, 15, 20, 30, 60, 120]
 
             func makeSchedule(title: String, selected: [String], seconds: Int)
                 -> (NSView, [(String, NSButton)], NSPopUpButton) {

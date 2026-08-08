@@ -13,8 +13,10 @@ import Foundation
 struct ProviderUsage {
     var primaryPct: Double?     // 5h window used %
     var primaryResetMin: Int?   // minutes until it resets
+    var primaryResetAt: TimeInterval? // absolute Unix reset instant
     var weeklyPct: Double?      // 7d / weekly window used %
     var weeklyResetMin: Int?
+    var weeklyResetAt: TimeInterval?  // absolute Unix reset instant
     var error: String?
     var fetchedAt: Date?
     var rateLimited = false
@@ -95,9 +97,13 @@ final class UsageFetcher {
         let now = Date().timeIntervalSince1970
         var dict: [String: Any] = ["at": now]
         if let p = u.primaryPct { dict["pPct"] = p }
-        if let r = u.primaryResetMin { dict["pResetAt"] = now + Double(r) * 60 }
+        if let r = u.primaryResetAt ?? u.primaryResetMin.map({ now + Double($0) * 60 }) {
+            dict["pResetAt"] = r
+        }
         if let w = u.weeklyPct { dict["wPct"] = w }
-        if let r = u.weeklyResetMin { dict["wResetAt"] = now + Double(r) * 60 }
+        if let r = u.weeklyResetAt ?? u.weeklyResetMin.map({ now + Double($0) * 60 }) {
+            dict["wResetAt"] = r
+        }
         if let data = try? JSONSerialization.data(withJSONObject: dict) {
             UserDefaults.standard.set(data, forKey: key)
         }
@@ -114,9 +120,11 @@ final class UsageFetcher {
         u.weeklyPct = (dict["wPct"] as? NSNumber)?.doubleValue
         guard u.primaryPct != nil || u.weeklyPct != nil else { return nil }
         if let r = (dict["pResetAt"] as? NSNumber)?.doubleValue {
+            u.primaryResetAt = r
             u.primaryResetMin = max(0, Int((r - now) / 60))
         }
         if let r = (dict["wResetAt"] as? NSNumber)?.doubleValue {
+            u.weeklyResetAt = r
             u.weeklyResetMin = max(0, Int((r - now) / 60))
         }
         u.fetchedAt = Date(timeIntervalSince1970: at)
@@ -247,7 +255,8 @@ final class UsageFetcher {
             guard let w = rateLimit[key] as? [String: Any] else { continue }
             let pct = (w["used_percent"] as? NSNumber)?.doubleValue
             var resetMin: Int?
-            if let reset = (w["reset_at"] as? NSNumber)?.doubleValue {
+            let resetAt = (w["reset_at"] as? NSNumber)?.doubleValue
+            if let reset = resetAt {
                 resetMin = max(0, Int((reset - now) / 60))
             }
             let windowSec = (w["limit_window_seconds"] as? NSNumber)?.doubleValue ?? fallbackSec
@@ -255,10 +264,12 @@ final class UsageFetcher {
                 if usage.weeklyPct == nil {
                     usage.weeklyPct = pct
                     usage.weeklyResetMin = resetMin
+                    usage.weeklyResetAt = resetAt
                 }
             } else if usage.primaryPct == nil {
                 usage.primaryPct = pct
                 usage.primaryResetMin = resetMin
+                usage.primaryResetAt = resetAt
             }
         }
         usage.fetchedAt = Date()

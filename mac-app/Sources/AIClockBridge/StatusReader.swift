@@ -24,9 +24,11 @@ struct CodexStatus {
     var primaryPct: Double? = nil
     var primaryWindowMin: Int? = nil
     var primaryResetMin: Int? = nil
+    var primaryResetAt: Int? = nil
     var weeklyPct: Double? = nil
     var weeklyWindowMin: Int? = nil
     var weeklyResetMin: Int? = nil
+    var weeklyResetAt: Int? = nil
     var needsInput: Bool = false
 }
 
@@ -183,10 +185,12 @@ final class StatusService {
             if let pct = codexUsage.primaryPct {
                 snap.codex.primaryPct = pct
                 snap.codex.primaryResetMin = codexUsage.primaryResetMin
+                snap.codex.primaryResetAt = codexUsage.primaryResetAt.map(Int.init)
             }
             if let pct = codexUsage.weeklyPct {
                 snap.codex.weeklyPct = pct
                 snap.codex.weeklyResetMin = codexUsage.weeklyResetMin
+                snap.codex.weeklyResetAt = codexUsage.weeklyResetAt.map(Int.init)
             }
         }
         snap.claude.status = overrideStatus(snap.claude.status, with: claudeEvent, now: now)
@@ -331,7 +335,8 @@ final class StatusService {
                 let pct = (w["used_percent"] as? NSNumber)?.doubleValue
                 let winMin = (w["window_minutes"] as? NSNumber)?.intValue
                 var resetMin: Int?
-                if let reset = (w["resets_at"] as? NSNumber)?.doubleValue {
+                let resetAt = (w["resets_at"] as? NSNumber)?.doubleValue
+                if let reset = resetAt {
                     resetMin = max(0, Int((reset - now) / 60))
                 }
                 if (winMin ?? fallbackMin) >= 2 * 1440 {
@@ -339,11 +344,13 @@ final class StatusService {
                         s.weeklyPct = pct
                         s.weeklyWindowMin = winMin
                         s.weeklyResetMin = resetMin
+                        s.weeklyResetAt = resetAt.map(Int.init)
                     }
                 } else if s.primaryPct == nil {
                     s.primaryPct = pct
                     s.primaryWindowMin = winMin
                     s.primaryResetMin = resetMin
+                    s.primaryResetAt = resetAt.map(Int.init)
                 }
             }
         }
@@ -356,6 +363,8 @@ extension Snapshot {
     func jsonData() -> Data {
         func num(_ v: Int?) -> Any { v.map { $0 as Any } ?? NSNull() }
         func num(_ v: Double?) -> Any { v.map { $0 as Any } ?? NSNull() }
+        let resetDate = codex.weeklyResetAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        let weeklyResetOffset = resetDate.map { TimeZone.current.secondsFromGMT(for: $0) }
         let dict: [String: Any] = [
             "ts": ts,
             "music_playing": musicPlaying,
@@ -376,9 +385,12 @@ extension Snapshot {
                 "primary_pct": num(codex.primaryPct),
                 "primary_window_min": num(codex.primaryWindowMin),
                 "primary_reset_min": num(codex.primaryResetMin),
+                "primary_reset_at": num(codex.primaryResetAt),
                 "weekly_pct": num(codex.weeklyPct),
                 "weekly_window_min": num(codex.weeklyWindowMin),
                 "weekly_reset_min": num(codex.weeklyResetMin),
+                "weekly_reset_at": num(codex.weeklyResetAt),
+                "weekly_reset_utc_offset_sec": num(weeklyResetOffset),
                 "needs_input": codex.needsInput,
             ],
         ]

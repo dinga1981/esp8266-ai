@@ -235,6 +235,8 @@ struct CodexStatus {
   int primaryResetMin = -1;
   float weeklyPct = -1;
   int weeklyResetMin = -1;
+  int64_t weeklyResetAt = -1; // absolute Unix reset instant from the bridge
+  int weeklyResetUtcOffsetSec = 0; // local offset at that instant (handles DST)
   bool needsInput = false;
 };
 
@@ -276,7 +278,8 @@ void saveBrightness() {
 }
 
 bool validAutoCycleSeconds(int seconds) {
-  return seconds == 5 || seconds == 10 || seconds == 30 || seconds == 60 || seconds == 120;
+  return seconds == 5 || seconds == 10 || seconds == 15 || seconds == 20 ||
+         seconds == 30 || seconds == 60 || seconds == 120;
 }
 
 const uint8_t VISIBLE_AUTO_MASK =
@@ -923,6 +926,7 @@ void drawAppLogo() {
 // day the readout changes to hours.
 const int RESET_CX = 198, RESET_LABEL_Y = 18, RESET_VALUE_Y = 33;
 String lastResetDays;
+String lastExactResetTime;
 
 String resetDaysText(int min) {
   if (min < 0) return "";
@@ -939,6 +943,33 @@ void drawResetDays(bool force) {
   drawTinyBoldText("RESET", RESET_CX, RESET_LABEL_Y, TFT_LIGHTGREY);
   int pitch = t.length() <= 2 ? 4 : 3;
   drawDotTextC(t, RESET_CX, RESET_VALUE_Y, pitch, 1, TFT_WHITE);
+}
+
+// Exact Codex weekly reset time in the bridge Mac's local timezone. The
+// bridge sends both the absolute Unix instant and the UTC offset that applies
+// at that future instant, so this remains correct across daylight-saving
+// transitions and does not depend on the weather page having synchronised.
+void drawExactResetTime(bool force) {
+  if (currentApp != APP_CODEX) return;
+  String dateText, timeText;
+  if (codexStatus.weeklyResetAt > 0) {
+    time_t localReset = (time_t)(codexStatus.weeklyResetAt +
+                                 codexStatus.weeklyResetUtcOffsetSec);
+    struct tm resetTm;
+    gmtime_r(&localReset, &resetTm);
+    char dateBuf[32], timeBuf[32];
+    snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d", resetTm.tm_mon + 1, resetTm.tm_mday);
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", resetTm.tm_hour, resetTm.tm_min);
+    dateText = dateBuf;
+    timeText = timeBuf;
+  }
+  const String key = dateText + "|" + timeText;
+  if (!force && key == lastExactResetTime) return;
+  lastExactResetTime = key;
+  tft.fillRect(75, 18, 81, 31, TFT_BLACK);
+  if (dateText.length() == 0) return;
+  drawSqTextC(dateText, 116, 18, 2, 1, TFT_LIGHTGREY);
+  drawDotTextC(timeText, 116, 33, 2, 1, TFT_WHITE);
 }
 
 // Codex's ring percentage: the 5h window when it exists, otherwise the
@@ -978,6 +1009,7 @@ void drawActiveApp() {
   }
   if (showingCd != CD_NONE) drawCountdown(true);
   drawAppLogo();
+  drawExactResetTime(true);
   drawResetDays(true);
 }
 
@@ -995,6 +1027,7 @@ void refreshActiveApp() {
     drawSquareRing(codexRingPct(), currentStatusColor());
     drawQuotaText(codexStatus.primaryPct, codexStatus.weeklyPct, false);
   }
+  drawExactResetTime(false);
   drawResetDays(false);
   if (showingCd != CD_NONE) {
     syncCountdownDeadline();
@@ -2009,6 +2042,8 @@ bool parseStatusJson(const String &payload) {
     codexStatus.primaryResetMin = x["primary_reset_min"] | -1;
     codexStatus.weeklyPct = x["weekly_pct"] | -1.0;
     codexStatus.weeklyResetMin = x["weekly_reset_min"] | -1;
+    codexStatus.weeklyResetAt = x["weekly_reset_at"] | (int64_t)-1;
+    codexStatus.weeklyResetUtcOffsetSec = x["weekly_reset_utc_offset_sec"] | 0;
     codexStatus.needsInput = x["needs_input"] | false;
   }
   statusMusicPlaying = doc["music_playing"] | false;
@@ -2407,7 +2442,7 @@ void handleApiAutoCycle() {
     return;
   }
   if (!validAutoCycleSeconds(weekdaySeconds) || !validAutoCycleSeconds(weekendSeconds)) {
-    webServer.send(400, "text/plain", "seconds must be 5|10|30|60|120");
+    webServer.send(400, "text/plain", "seconds must be 5|10|15|20|30|60|120");
     return;
   }
   weekdayAutoPageMask = weekdayMask;
