@@ -19,6 +19,7 @@ final class UsageFetcherTests: XCTestCase {
         XCTAssertNil(usage.primaryPct)
         XCTAssertNotNil(usage.weeklyResetMin)
         XCTAssertTrue((58...60).contains(usage.weeklyResetMin!))
+        XCTAssertEqual(usage.weeklyResetAt ?? 0, now + 3_600, accuracy: 0.001)
     }
 
     func testQuotaCacheOlderThanOneDayIsIgnored() throws {
@@ -34,5 +35,23 @@ final class UsageFetcherTests: XCTestCase {
         defer { UserDefaults.standard.removeObject(forKey: key) }
 
         XCTAssertNil(UsageFetcher().codex.weeklyPct)
+    }
+
+    func testCodexSnapshotIncludesAbsoluteWeeklyResetTimeAndOffset() throws {
+        let epoch = 1_786_786_074
+        var codex = CodexStatus()
+        codex.weeklyPct = 42.5
+        codex.weeklyResetMin = 9_000
+        codex.weeklyResetAt = epoch
+        let snapshot = Snapshot(claude: ClaudeStatus(), codex: codex, ts: epoch - 60)
+
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot.jsonData())
+            as? [String: Any])
+        let encodedCodex = try XCTUnwrap(object["codex"] as? [String: Any])
+        XCTAssertEqual((encodedCodex["weekly_reset_at"] as? NSNumber)?.intValue, epoch)
+        let expectedOffset = TimeZone.current.secondsFromGMT(
+            for: Date(timeIntervalSince1970: TimeInterval(epoch)))
+        XCTAssertEqual((encodedCodex["weekly_reset_utc_offset_sec"] as? NSNumber)?.intValue,
+                       expectedOffset)
     }
 }

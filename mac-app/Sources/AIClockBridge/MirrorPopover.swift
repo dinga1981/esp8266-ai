@@ -82,6 +82,7 @@ final class MirrorView: NSView {
     var hourPct: Double?
     var weekPct: Double?
     var weeklyResetMin: Int?
+    var weeklyResetAt: Int?
     private(set) var countdownKind: CountdownKind?
     private var countdownDeadline: Date?
     var showingClaude = true
@@ -166,6 +167,7 @@ final class MirrorView: NSView {
         "k": DotGlyph(width: 5, rows: [0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010]),
         "%": DotGlyph(width: 5, rows: [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011]),
         ":": DotGlyph(width: 1, rows: [0, 0, 1, 0, 1, 0, 0]),
+        "/": DotGlyph(width: 3, rows: [0b001, 0b001, 0b010, 0b010, 0b010, 0b100, 0b100]),
         "-": DotGlyph(width: 3, rows: [0, 0, 0, 0b111, 0, 0, 0]),
         " ": DotGlyph(width: 2, rows: [0, 0, 0, 0, 0, 0, 0]),
     ]
@@ -274,6 +276,7 @@ final class MirrorView: NSView {
         }
 
         drawQuotaText(ctx)
+        drawExactResetTime(ctx)
         drawResetDays(ctx)
         if countdownKind != nil { drawCountdown(ctx) }
 
@@ -421,6 +424,20 @@ final class MirrorView: NSView {
         }
         drawDotText(text, centerX: 198, y: 33, pitch: text.count <= 2 ? 4 : 3,
                     radius: 1, color: .white, context: context)
+    }
+
+    /// Codex exposes an absolute weekly reset timestamp. Mirror the firmware's
+    /// compact top-centre presentation: month/day above local hour/minute.
+    private func drawExactResetTime(_ context: CGContext) {
+        guard !showingClaude, let epoch = weeklyResetAt, epoch > 0 else { return }
+        let components = Calendar.current.dateComponents(in: .current,
+            from: Date(timeIntervalSince1970: TimeInterval(epoch)))
+        let date = String(format: "%02d/%02d", components.month ?? 0, components.day ?? 0)
+        let time = String(format: "%02d:%02d", components.hour ?? 0, components.minute ?? 0)
+        drawSquareText(date, centerX: 116, y: 18, pitch: 2, diameter: 1,
+                       color: NSColor(calibratedWhite: 0.58, alpha: 1), context: context)
+        drawDotText(time, centerX: 116, y: 33, pitch: 2, radius: 1,
+                    color: .white, context: context)
     }
 
     private func drawCountdown(_ context: CGContext) {
@@ -1017,6 +1034,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.hourPct = pct
             mirror.weekPct = snap.claude.sevenDayPct
             mirror.weeklyResetMin = snap.claude.sevenDayResetMin
+            mirror.weeklyResetAt = nil
             if let weekly = snap.claude.sevenDayPct,
                weekly >= 99.9, snap.claude.sevenDayResetMin != nil {
                 mirror.syncCountdown(kind: .weekly, resetMin: snap.claude.sevenDayResetMin)
@@ -1033,6 +1051,7 @@ final class MirrorPopoverController: NSObject, NSPopoverDelegate {
             mirror.hourPct = snap.codex.primaryPct
             mirror.weekPct = snap.codex.weeklyPct
             mirror.weeklyResetMin = snap.codex.weeklyResetMin
+            mirror.weeklyResetAt = snap.codex.weeklyResetAt
             if let weekly = snap.codex.weeklyPct,
                weekly >= 99.9, snap.codex.weeklyResetMin != nil {
                 mirror.syncCountdown(kind: .weekly, resetMin: snap.codex.weeklyResetMin)

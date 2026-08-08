@@ -1,5 +1,6 @@
 firmware/.pio/
 firmware/.pio-venv/
+.platformio-core/
 mac-app/.build/
 windows-app/**/bin/
 windows-app/**/obj/
@@ -8,3 +9,4 @@ __pycache__/
 .DS_Store
 .claude/
 dist/
+artifacts/
