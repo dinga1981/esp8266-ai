@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 // Menu-bar item: a retro Macintosh icon (drawn in code, template so it adapts
 // to light/dark menu bars). Left click opens a live mirror of the ESP8266
@@ -153,6 +154,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(resetItem)
 
         menu.addItem(makeItem("把本机设为设备桥接", #selector(pointBridgeHere)))
+        let settingsMenu = NSMenu()
+        settingsMenu.addItem(makeItem("导出全部设置…", #selector(exportSettings)))
+        settingsMenu.addItem(makeItem("从备份一键恢复…", #selector(restoreSettings)))
+        let settingsItem = NSMenuItem(title: "设置备份与恢复", action: nil, keyEquivalent: "")
+        settingsItem.submenu = settingsMenu
+        menu.addItem(settingsItem)
         menu.addItem(.separator())
         menu.addItem(makeItem("刷新", #selector(refreshAction), key: "r"))
         menu.addItem(makeItem("桥接服务地址", #selector(showAddress)))
@@ -290,6 +297,80 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func exportSettings() {
+        guard DeviceClient.baseURL != nil else {
+            Self.toast("无法备份", "请先配对设备；完整备份需要同时读取设备端设置。")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "导出 AI Clock 全部设置"
+        panel.nameFieldStringValue = "AIClock-设置备份-\(Self.backupDate()).json"
+        panel.allowedContentTypes = [.json]
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        DeviceClient.fetchSettings { result in
+            do {
+                let device = try result.get()
+                let data = try SettingsBackup.makeData(device: device)
+                try data.write(to: url, options: .atomic)
+                Self.toast("备份完成", "Mac 行情、天气和设备显示设置已保存。\n\n未包含 Wi-Fi 密码、登录凭据和桌宠动画文件。")
+            } catch {
+                Self.toast("备份失败", error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func restoreSettings() {
+        guard DeviceClient.baseURL != nil else {
+            Self.toast("无法恢复", "请先配对要恢复设置的设备。")
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "选择 AI Clock 设置备份"
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let contents = try SettingsBackup.parse(Data(contentsOf: url))
+            let confirm = NSAlert()
+            confirm.messageText = "恢复这份设置？"
+            confirm.informativeText = "将覆盖当前行情收藏、天气城市、亮度、显示模式和工作日/周末轮播设置。Wi-Fi 和桌宠动画不会改变。"
+            confirm.addButton(withTitle: "一键恢复")
+            confirm.addButton(withTitle: "取消")
+            guard confirm.runModal() == .alertFirstButtonReturn else { return }
+            var deviceSettings = contents.device
+            if let localIP = DeviceClient.localIPv4() {
+                deviceSettings["bridge"] = "\(localIP):\(port)"
+            }
+            DeviceClient.restoreSettings(deviceSettings) { [weak self] error in
+                guard let self else { return }
+                if let error {
+                    Self.toast("恢复失败", "设备端没有修改：\(error.localizedDescription)")
+                    return
+                }
+                do {
+                    try SettingsBackup.applyMac(contents.mac)
+                    self.market.reloadConfiguredSettings()
+                    self.weather.reloadConfiguredLocation()
+                    self.rebuildMarketInstrumentMenu()
+                    self.refreshDeviceSection()
+                    Self.toast("恢复完成", "Mac 与设备设置均已恢复并立即生效。")
+                } catch {
+                    Self.toast("部分恢复", "设备设置已恢复，但 Mac 设置失败：\(error.localizedDescription)")
+                }
+            }
+        } catch {
+            Self.toast("无法读取备份", error.localizedDescription)
+        }
+    }
+
+    private static func backupDate() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
     }
 
     @objc private func setDisplayMode(_ sender: NSMenuItem) {

@@ -304,6 +304,7 @@ final class MirrorView: NSView {
         ctx.restoreGState()
     }
 
+
     private static func glyph(_ c: Character) -> DotGlyph? {
         if let glyph = dotGlyphs[c] { return glyph }
         let upper = Character(String(c).uppercased())
@@ -434,8 +435,11 @@ final class MirrorView: NSView {
             from: Date(timeIntervalSince1970: TimeInterval(epoch)))
         let date = String(format: "%02d/%02d", components.month ?? 0, components.day ?? 0)
         let time = String(format: "%02d:%02d", components.hour ?? 0, components.minute ?? 0)
-        drawSquareText(date, centerX: 116, y: 18, pitch: 2, diameter: 1,
-                       color: NSColor(calibratedWhite: 0.58, alpha: 1), context: context)
+        let centered = NSMutableParagraphStyle(); centered.alignment = .center
+        (date as NSString).draw(in: NSRect(x: 75, y: 14, width: 81, height: 17), withAttributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: NSColor.white, .paragraphStyle: centered,
+        ])
         drawDotText(time, centerX: 116, y: 33, pitch: 2, radius: 1,
                     color: .white, context: context)
     }
@@ -674,16 +678,16 @@ final class MirrorView: NSView {
         let now = Date()
         let month = calendar.component(.month, from: now)
         let day = calendar.component(.day, from: now)
-        let weekdayNames = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+        let weekdayNames = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
         let weekday = weekdayNames[max(1, calendar.component(.weekday, from: now)) - 1]
-        let dateText = String(format: "%02d/%02d %@", month, day, weekday)
-        let headerFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
-        (weather.city as NSString).draw(at: NSPoint(x: 10, y: 9), withAttributes: [
-            .font: headerFont, .foregroundColor: cyan,
+        let dateText = "\(month)月\(day)日 \(weekday)"
+        (weather.city as NSString).draw(in: NSRect(x: 6, y: 5, width: 102, height: 24), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 17, weight: .semibold), .foregroundColor: cyan,
         ])
         let right = NSMutableParagraphStyle(); right.alignment = .right
-        (dateText as NSString).draw(in: NSRect(x: 108, y: 9, width: 122, height: 16), withAttributes: [
-            .font: headerFont, .foregroundColor: muted, .paragraphStyle: right,
+        (dateText as NSString).draw(in: NSRect(x: 106, y: 6, width: 128, height: 23), withAttributes: [
+            .font: NSFont.systemFont(ofSize: 15, weight: .medium),
+            .foregroundColor: muted, .paragraphStyle: right,
         ])
 
         let parts = calendar.dateComponents([.hour, .minute, .second], from: now)
@@ -701,9 +705,9 @@ final class MirrorView: NSView {
             .font: NSFont.monospacedDigitSystemFont(ofSize: 34, weight: .medium),
             .foregroundColor: NSColor.white,
         ])
-        ((weather.hasData ? weather.currentText : "WAITING") as NSString).draw(
-            in: NSRect(x: 107, y: 133, width: 120, height: 20), withAttributes: [
-                .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
+        ((weather.hasData ? weather.currentText : "等待天气") as NSString).draw(
+            in: NSRect(x: 107, y: 137, width: 125, height: 23), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 17, weight: .semibold),
                 .foregroundColor: cyan,
             ])
 
@@ -715,8 +719,8 @@ final class MirrorView: NSView {
 
         func drawDay(x: CGFloat, title: String, code: Int, text: String, high: Double, low: Double) {
             drawWeatherIcon(code: code, center: CGPoint(x: x + 27, y: 203), size: 30, ctx: ctx)
-            ((title + " · " + text) as NSString).draw(in: NSRect(x: x + 50, y: 180, width: 67, height: 16),
-                withAttributes: [.font: NSFont.monospacedSystemFont(ofSize: 8, weight: .medium),
+            ((title + "  " + text) as NSString).draw(in: NSRect(x: x + 42, y: 178, width: 77, height: 24),
+                withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .medium),
                                  .foregroundColor: muted])
             let hi = weather.hasData ? "\(Int(high.rounded()))°" : "--°"
             let lo = weather.hasData ? "\(Int(low.rounded()))°" : "--°"
@@ -729,9 +733,9 @@ final class MirrorView: NSView {
                 .foregroundColor: cool,
             ])
         }
-        drawDay(x: 0, title: "TODAY", code: weather.todayCode, text: weather.todayText,
+        drawDay(x: 0, title: "今天", code: weather.todayCode, text: weather.todayText,
                 high: weather.todayHigh, low: weather.todayLow)
-        drawDay(x: 120, title: "TMRW", code: weather.tomorrowCode, text: weather.tomorrowText,
+        drawDay(x: 120, title: "明天", code: weather.tomorrowCode, text: weather.tomorrowText,
                 high: weather.tomorrowHigh, low: weather.tomorrowLow)
     }
 

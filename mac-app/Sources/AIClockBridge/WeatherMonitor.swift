@@ -1,7 +1,8 @@
+import AppKit
 import Foundation
 
 struct WeatherSnapshot {
-    var city = "SHANGHAI"
+    var city = "上海"
     var timeZone = "Asia/Shanghai"
     var utcOffsetSeconds = 8 * 3600
     var currentTemperature = 0.0
@@ -35,7 +36,7 @@ final class WeatherMonitor {
     }
 
     private static let locationKey = "weather_location_v1"
-    private static let defaultLocation = Location(query: "Shanghai", displayName: "SHANGHAI",
+    private static let defaultLocation = Location(query: "上海", displayName: "上海",
                                                   latitude: 31.2304, longitude: 121.4737,
                                                   timeZone: "Asia/Shanghai")
     private let lock = NSLock()
@@ -61,8 +62,29 @@ final class WeatherMonitor {
 
     var configuredCity: String { location.query }
 
-    func start() {
+    func reloadConfiguredLocation() {
+        let saved: Location
+        if let data = UserDefaults.standard.data(forKey: Self.locationKey),
+           let decoded = try? JSONDecoder().decode(Location.self, from: data) {
+            saved = decoded
+        } else {
+            saved = Self.defaultLocation
+        }
+        location = saved
+        lock.lock()
+        value = WeatherSnapshot(city: saved.displayName, timeZone: saved.timeZone)
+        lock.unlock()
         refresh()
+    }
+
+    func start() {
+        if location.displayName.unicodeScalars.allSatisfy({ $0.value < 128 }) {
+            // Migrate v0.5.7/v0.5.8 locations whose names were deliberately
+            // transliterated to ASCII before the Chinese strip protocol existed.
+            setCity(location.query) { _ in }
+        } else {
+            refresh()
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { [weak self] _ in
             self?.refresh()
         }
@@ -82,7 +104,7 @@ final class WeatherMonitor {
         components.queryItems = [
             URLQueryItem(name: "name", value: trimmed),
             URLQueryItem(name: "count", value: "1"),
-            URLQueryItem(name: "language", value: "en"),
+            URLQueryItem(name: "language", value: "zh"),
             URLQueryItem(name: "format", value: "json"),
         ]
         var request = URLRequest(url: components.url!)
@@ -104,7 +126,7 @@ final class WeatherMonitor {
             let admin = result["admin1"] as? String
             let country = result["country"] as? String
             let detail = [name, admin, country].compactMap { $0 }.joined(separator: ", ")
-            let newLocation = Location(query: trimmed, displayName: Self.asciiCity(name),
+            let newLocation = Location(query: trimmed, displayName: Self.localizedCity(name),
                                        latitude: latitude, longitude: longitude,
                                        timeZone: result["timezone"] as? String ?? "auto")
             self?.fetchForecast(for: newLocation) { error in
@@ -145,6 +167,76 @@ final class WeatherMonitor {
             "updated_unix": Int(snap.updatedAt?.timeIntervalSince1970 ?? 0),
         ]
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
+    }
+
+    /// Fixed-layout Chinese text strips consumed by the ESP8266 weather page.
+    /// Rendering here avoids carrying a large CJK font in the constrained
+    /// firmware. Layout: city 108x32, date 132x32, current 130x22,
+    /// today 78x28, tomorrow 78x28; all RGB565 big-endian.
+    func textRGB565() -> Data {
+        let snap = snapshot
+        let timeZone = TimeZone(identifier: snap.timeZone)
+            ?? TimeZone(secondsFromGMT: snap.utcOffsetSeconds) ?? .current
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let parts = calendar.dateComponents([.month, .day, .weekday], from: Date())
+        let weekdays = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+        let weekday = weekdays[max(0, min(6, (parts.weekday ?? 1) - 1))]
+        let date = "\(parts.month ?? 0)月\(parts.day ?? 0)日 \(weekday)"
+        var output = Data()
+        output.append(Self.renderStrip(snap.city, width: 108, height: 32, fontSize: 17,
+                                       weight: .semibold, alignment: .left,
+                                       foreground: NSColor(calibratedRed: 125/255, green: 217/255, blue: 1, alpha: 1),
+                                       background: NSColor(calibratedRed: 17/255, green: 35/255, blue: 51/255, alpha: 1)))
+        output.append(Self.renderStrip(date, width: 132, height: 32, fontSize: 15,
+                                       weight: .medium, alignment: .right,
+                                       foreground: NSColor(calibratedWhite: 0.82, alpha: 1),
+                                       background: NSColor(calibratedRed: 17/255, green: 35/255, blue: 51/255, alpha: 1)))
+        output.append(Self.renderStrip(snap.hasData ? snap.currentText : "等待天气", width: 130,
+                                       height: 22, fontSize: 17, weight: .semibold,
+                                       alignment: .left,
+                                       foreground: NSColor(calibratedRed: 125/255, green: 217/255, blue: 1, alpha: 1),
+                                       background: .black))
+        let footer = NSColor(calibratedRed: 9/255, green: 19/255, blue: 29/255, alpha: 1)
+        output.append(Self.renderStrip("今天  \(snap.todayText)", width: 78, height: 28,
+                                       fontSize: 12, weight: .medium, alignment: .left,
+                                       foreground: NSColor(calibratedWhite: 0.78, alpha: 1), background: footer))
+        output.append(Self.renderStrip("明天  \(snap.tomorrowText)", width: 78, height: 28,
+                                       fontSize: 12, weight: .medium, alignment: .left,
+                                       foreground: NSColor(calibratedWhite: 0.78, alpha: 1), background: footer))
+        return output
+    }
+
+    private static func renderStrip(_ text: String, width: Int, height: Int, fontSize: CGFloat,
+                                    weight: NSFont.Weight, alignment: NSTextAlignment,
+                                    foreground: NSColor, background: NSColor) -> Data {
+        guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+                                  bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return Data(count: width * height * 2)
+        }
+        ctx.setFillColor(background.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        let style = NSMutableParagraphStyle()
+        style.alignment = alignment
+        style.lineBreakMode = .byTruncatingTail
+        style.minimumLineHeight = fontSize + 1
+        style.maximumLineHeight = fontSize + 1
+        (text as NSString).draw(in: NSRect(x: 4, y: 2, width: width - 8, height: height - 4),
+                                withAttributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: weight),
+                                                 .foregroundColor: foreground, .paragraphStyle: style])
+        NSGraphicsContext.restoreGraphicsState()
+        guard let rendered = ctx.data else { return Data(count: width * height * 2) }
+        let pixels = rendered.bindMemory(to: UInt8.self, capacity: width * height * 4)
+        var data = Data(capacity: width * height * 2)
+        for i in 0..<(width * height) {
+            let value = (UInt16(pixels[i * 4] & 0xF8) << 8)
+                | (UInt16(pixels[i * 4 + 1] & 0xFC) << 3) | UInt16(pixels[i * 4 + 2] >> 3)
+            data.append(UInt8(value >> 8)); data.append(UInt8(value & 0xFF))
+        }
+        return data
     }
 
     private func fetchForecast(for target: Location, completion: ((Error?) -> Void)?) {
@@ -198,28 +290,24 @@ final class WeatherMonitor {
 
     static func conditionText(_ code: Int) -> String {
         switch code {
-        case 0: return "SUNNY"
-        case 1, 2: return "PARTLY"
-        case 3: return "CLOUDY"
-        case 45, 48: return "FOG"
-        case 51, 53, 55, 56, 57: return "DRIZZLE"
-        case 61, 63, 65, 66, 67: return "RAIN"
-        case 71, 73, 75, 77, 85, 86: return "SNOW"
-        case 80, 81, 82: return "SHOWERS"
-        case 95, 96, 99: return "STORM"
-        default: return "WEATHER"
+        case 0: return "晴"
+        case 1: return "大部晴朗"
+        case 2: return "多云"
+        case 3: return "阴"
+        case 45, 48: return "有雾"
+        case 51, 53, 55, 56, 57: return "毛毛雨"
+        case 61: return "小雨"
+        case 63, 66: return "中雨"
+        case 65, 67: return "大雨"
+        case 71, 73, 75, 77, 85, 86: return "降雪"
+        case 80, 81, 82: return "阵雨"
+        case 95, 96, 99: return "雷雨"
+        default: return "天气未知"
         }
     }
 
-    private static func asciiCity(_ value: String) -> String {
-        let latin = value.applyingTransform(.toLatin, reverse: false)?
-            .applyingTransform(.stripDiacritics, reverse: false) ?? value
-        let allowed = latin.uppercased().unicodeScalars.filter {
-            CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -").contains($0)
-        }
-        let cleaned = String(String.UnicodeScalarView(allowed))
-            .split(whereSeparator: { $0 == " " }).joined(separator: " ")
-        return String((cleaned.isEmpty ? "CITY" : cleaned).prefix(18))
+    private static func localizedCity(_ value: String) -> String {
+        String(value.trimmingCharacters(in: .whitespacesAndNewlines).prefix(12))
     }
 
     private static func error(_ message: String) -> NSError {

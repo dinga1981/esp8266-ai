@@ -1,5 +1,7 @@
 import Foundation
 
+let aiClockBridgeVersion = "0.5.9"
+
 // Port of the old bridge.py log-reading logic. No account APIs / keys are
 // touched - everything comes from the JSONL session logs Claude Code and Codex
 // CLI already write to disk:
@@ -367,6 +369,7 @@ extension Snapshot {
         let weeklyResetOffset = resetDate.map { TimeZone.current.secondsFromGMT(for: $0) }
         let dict: [String: Any] = [
             "ts": ts,
+            "bridge_version": aiClockBridgeVersion,
             "music_playing": musicPlaying,
             "claude": [
                 "status": claude.status,

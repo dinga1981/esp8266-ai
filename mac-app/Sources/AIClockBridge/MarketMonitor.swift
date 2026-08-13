@@ -564,6 +564,35 @@ final class MarketMonitor {
         queue.async { [weak self] in self?.refresh() }
     }
 
+    func reloadConfiguredSettings() {
+        let defaults = UserDefaults.standard
+        let ids = defaults.stringArray(forKey: Self.favoritesKey)
+            ?? MarketInstrument.defaultFavorites.map(\.id)
+        var loaded = ids.compactMap { MarketInstrument.preset(id: $0) ?? MarketInstrument.parse($0) }
+        loaded = Array(loaded.prefix(Self.maxFavorites))
+        if loaded.isEmpty { loaded = Array(MarketInstrument.defaultFavorites.prefix(Self.maxFavorites)) }
+        let selected = defaults.string(forKey: "market_instrument_id")
+            .flatMap { MarketInstrument.preset(id: $0) ?? MarketInstrument.parse($0) }
+            ?? loaded[0]
+        let interval = defaults.string(forKey: "btc_interval")
+            .flatMap(MarketInterval.init(rawValue:)) ?? .fiveMinutes
+        let cadence = defaults.string(forKey: Self.refreshIntervalKey)
+            .flatMap(MarketRefreshInterval.init(rawValue:)) ?? .tenSeconds
+
+        lock.lock()
+        favoriteItems = loaded
+        requestedInstrument = selected
+        requestedInterval = interval
+        refreshInterval = cadence
+        rotationIndex = loaded.firstIndex(of: selected) ?? 0
+        snapshotCache.removeAll()
+        frameCache.removeAll()
+        retryAfter.removeAll()
+        lock.unlock()
+        timer?.schedule(deadline: .now() + cadence.seconds, repeating: cadence.seconds)
+        queue.async { [weak self] in self?.refresh() }
+    }
+
     func setRefreshInterval(_ interval: MarketRefreshInterval) {
         lock.lock()
         refreshInterval = interval

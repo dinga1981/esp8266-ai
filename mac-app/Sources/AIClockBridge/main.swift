@@ -74,6 +74,7 @@ let server = HTTPServer(port: port, routes: [
     "/stock/names.raw": { stockMonitor.namesRGB565() },
     "/market/frame.rle": { marketMonitor.packedFrameEnvelope },
     "/market/frame.raw": { marketMonitor.frameEnvelope },
+    "/weather/text.raw": { weatherMonitor.textRGB565() },
 ], postRoutes: [
     // Claude Code / Codex hooks push lifecycle events here (see README §7):
     // curl -d '{"agent":"claude","event":"PreToolUse"}' http://127.0.0.1:8765/event
