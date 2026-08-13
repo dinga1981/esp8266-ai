@@ -1,7 +1,7 @@
 #pragma once
 
 // ---- Firmware version (shown on the first-time WiFi setup screen & /api/info) ----
-#define FW_VERSION "0.5.8"
+#define FW_VERSION "0.5.9"
 
 // ---- Bridge polling ----
 #define BRIDGE_DEFAULT_PORT 8765

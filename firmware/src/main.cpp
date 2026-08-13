@@ -9,6 +9,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
+#include <Updater.h>
 #include <WiFiClient.h>
 #include <WiFiManager.h>
 #include <LittleFS.h>
@@ -82,9 +83,9 @@ DisplayMode displayMode = MODE_AUTO;
 // AUTO is a user-configurable carousel. Bit N selects DisplayMode N; AUTO
 // itself is never a carousel page. Default preserves the original two-pet
 // experience until the user changes it from the Mac menu.
-uint8_t weekdayAutoPageMask = (1U << MODE_CODEX);
+uint16_t weekdayAutoPageMask = (1U << MODE_CODEX);
 uint16_t weekdayAutoCycleSeconds = AUTO_CYCLE_DEFAULT_SECONDS;
-uint8_t weekendAutoPageMask = (1U << MODE_CODEX);
+uint16_t weekendAutoPageMask = (1U << MODE_CODEX);
 uint16_t weekendAutoCycleSeconds = AUTO_CYCLE_DEFAULT_SECONDS;
 uint8_t autoPageIndex = 0;
 unsigned long autoPageStartedMs = 0;
@@ -175,10 +176,6 @@ unsigned long marketAutoDwellMs = 0;
 
 // ---------- date/weather mode ----------
 struct WeatherState {
-  String city = "SHANGHAI";
-  String currentText = "WAITING";
-  String todayText = "WAITING";
-  String tomorrowText = "WAITING";
   float currentTemp = 0;
   float todayHigh = 0, todayLow = 0;
   float tomorrowHigh = 0, tomorrowLow = 0;
@@ -215,6 +212,7 @@ unsigned long lastFlashMs = 0;
 // Bridge host is not asked for during first-time WiFi setup: the Mac/Windows
 // bridge discovers the device and pairs automatically (or set via /api/bridge).
 String bridgeHost;
+String bridgeVersion = "--";
 
 struct ClaudeStatus {
   String status = "unknown";
@@ -282,7 +280,7 @@ bool validAutoCycleSeconds(int seconds) {
          seconds == 30 || seconds == 60 || seconds == 120;
 }
 
-const uint8_t VISIBLE_AUTO_MASK =
+const uint16_t VISIBLE_AUTO_MASK =
     (1U << MODE_CODEX) | (1U << MODE_MUSIC) | (1U << MODE_STOCK) |
     (1U << MODE_MARKET) | (1U << MODE_WEATHER);
 
@@ -303,7 +301,7 @@ bool weatherIsWeekend() {
   return localTm.tm_wday == 0 || localTm.tm_wday == 6;
 }
 
-uint8_t activeAutoPageMask() {
+uint16_t activeAutoPageMask() {
   return weatherIsWeekend() ? weekendAutoPageMask : weekdayAutoPageMask;
 }
 
@@ -313,7 +311,7 @@ uint16_t activeAutoCycleSeconds() {
 
 uint8_t selectedAutoPageCount() {
   uint8_t count = 0;
-  const uint8_t mask = activeAutoPageMask();
+  const uint16_t mask = activeAutoPageMask();
   for (uint8_t mode = MODE_CODEX; mode <= MODE_WEATHER; ++mode) {
     if (mask & (1U << mode)) ++count;
   }
@@ -322,7 +320,7 @@ uint8_t selectedAutoPageCount() {
 
 DisplayMode autoPageAt(uint8_t selectedIndex) {
   uint8_t found = 0;
-  const uint8_t mask = activeAutoPageMask();
+  const uint16_t mask = activeAutoPageMask();
   for (uint8_t mode = MODE_CODEX; mode <= MODE_WEATHER; ++mode) {
     if (!(mask & (1U << mode))) continue;
     if (found++ == selectedIndex) return (DisplayMode)mode;
@@ -339,7 +337,7 @@ void loadAutoCycle() {
   String weekendMaskLine = f.readStringUntil('\n');
   String weekendSecondsLine = f.readStringUntil('\n');
   f.close();
-  uint8_t cleanWeekday = (uint8_t)weekdayMask & VISIBLE_AUTO_MASK;
+  uint16_t cleanWeekday = (uint16_t)weekdayMask & VISIBLE_AUTO_MASK;
   if (cleanWeekday == 0) cleanWeekday = 1U << MODE_CODEX;
   weekdayAutoPageMask = cleanWeekday;
   if (validAutoCycleSeconds(weekdaySeconds)) weekdayAutoCycleSeconds = weekdaySeconds;
@@ -350,7 +348,7 @@ void loadAutoCycle() {
     weekendAutoPageMask = weekdayAutoPageMask;
     weekendAutoCycleSeconds = weekdayAutoCycleSeconds;
   } else {
-    uint8_t cleanWeekend = (uint8_t)weekendMaskLine.toInt() & VISIBLE_AUTO_MASK;
+    uint16_t cleanWeekend = (uint16_t)weekendMaskLine.toInt() & VISIBLE_AUTO_MASK;
     if (cleanWeekend == 0) cleanWeekend = 1U << MODE_CODEX;
     weekendAutoPageMask = cleanWeekend;
     const int weekendSeconds = weekendSecondsLine.toInt();
@@ -968,7 +966,11 @@ void drawExactResetTime(bool force) {
   lastExactResetTime = key;
   tft.fillRect(75, 18, 81, 31, TFT_BLACK);
   if (dateText.length() == 0) return;
-  drawSqTextC(dateText, 116, 18, 2, 1, TFT_LIGHTGREY);
+  // The old 1-pixel square glyphs made 08/13 hard to distinguish on the
+  // physical 1.54-inch panel. Font 2 is wider, solid and anti-gap at this size.
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(dateText, 116, 15, 2);
   drawDotTextC(timeText, 116, 33, 2, 1, TFT_WHITE);
 }
 
@@ -1644,10 +1646,6 @@ bool handleWeatherPayload(const String &payload) {
   weather.valid = doc["valid"] | false;
   weather.stale = doc["stale"] | true;
   if (weather.valid) {
-    weather.city = String((const char *)(doc["city"] | "CITY")).substring(0, 18);
-    weather.currentText = String((const char *)(doc["current_text"] | "WEATHER")).substring(0, 10);
-    weather.todayText = String((const char *)(doc["today_text"] | "WEATHER")).substring(0, 10);
-    weather.tomorrowText = String((const char *)(doc["tomorrow_text"] | "WEATHER")).substring(0, 10);
     weather.currentTemp = doc["current_temp"] | 0.0;
     weather.currentCode = doc["current_code"] | 0;
     weather.todayHigh = doc["today_high"] | 0.0;
@@ -1718,31 +1716,47 @@ void drawWeatherClock() {
   time_t localEpoch = weatherLocalEpoch();
   struct tm localTm = {};
   if (localEpoch > 0) gmtime_r(&localEpoch, &localTm);
-  const char *weekdays[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
-  char dateText[16], timeText[16];
+  char timeText[16];
   if (localEpoch > 0) {
-    snprintf(dateText, sizeof(dateText), "%02d/%02d %s", localTm.tm_mon + 1,
-             localTm.tm_mday, weekdays[localTm.tm_wday]);
     snprintf(timeText, sizeof(timeText), "%02d:%02d:%02d", localTm.tm_hour,
              localTm.tm_min, localTm.tm_sec);
   } else {
-    strcpy(dateText, "--/-- ---");
     strcpy(timeText, "--:--:--");
   }
-  const uint16_t header = tft.color565(17, 35, 51);
-  const uint16_t cyan = tft.color565(125, 217, 255);
-  const uint16_t muted = tft.color565(151, 172, 188);
-  tft.fillRect(0, 0, SCREEN_W, 32, header);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(cyan, header);
-  tft.drawString(weather.city, 9, 9, 1);
-  tft.setTextDatum(TR_DATUM);
-  tft.setTextColor(muted, header);
-  tft.drawString(dateText, 231, 9, 1);
   tft.fillRect(0, 33, SCREEN_W, 43, TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString(timeText, SCREEN_CX, 39, 4);
+}
+
+bool drawWeatherTextStrip(WiFiClient *stream, int x, int y, int w, int h) {
+  const size_t bytes = (size_t)w * 2;
+  for (int row = 0; row < h; ++row) {
+    if (stream->readBytes((uint8_t *)rowBuf, bytes) != bytes) return false;
+    tft.pushImage(x, y + row, w, 1, rowBuf);
+    yield();
+  }
+  return true;
+}
+
+// Chinese city/date/condition labels are rendered by AppKit on the Mac and
+// streamed as five small RGB565 strips, avoiding a multi-hundred-KB CJK font
+// in ESP8266 flash.
+bool drawWeatherChineseText() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  if (!http.begin(client, "http://" + bridgeHost + "/weather/text.raw")) return false;
+  if (http.GET() != HTTP_CODE_OK) { http.end(); return false; }
+  WiFiClient *stream = http.getStreamPtr();
+  bool ok = drawWeatherTextStrip(stream, 0, 0, 108, 32) &&
+            drawWeatherTextStrip(stream, 108, 0, 132, 32) &&
+            drawWeatherTextStrip(stream, 107, 139, 130, 22) &&
+            drawWeatherTextStrip(stream, 42, 177, 78, 28) &&
+            drawWeatherTextStrip(stream, 162, 177, 78, 28);
+  http.end();
+  return ok;
 }
 
 void drawWeatherScreen(bool force) {
@@ -1769,11 +1783,8 @@ void drawWeatherScreen(bool force) {
   int tempWidth = tft.textWidth(current, 6);
   tft.drawCircle(112 + tempWidth, 98, 3, TFT_WHITE);
   tft.drawString("C", 119 + tempWidth, 105, 4);
-  tft.setTextColor(tft.color565(125, 217, 255), TFT_BLACK);
-  tft.drawString(weather.valid ? weather.currentText : "WAITING", 109, 143, 2);
 
   const uint16_t footer = tft.color565(9, 19, 29);
-  const uint16_t muted = tft.color565(151, 172, 188);
   const uint16_t warm = tft.color565(255, 180, 95);
   const uint16_t cool = tft.color565(119, 207, 255);
   tft.fillRect(1, 169, 118, 70, footer);
@@ -1781,15 +1792,10 @@ void drawWeatherScreen(bool force) {
   for (int day = 0; day < 2; ++day) {
     const int x = day * 120;
     const int code = day == 0 ? weather.todayCode : weather.tomorrowCode;
-    const String label = day == 0 ? "TODAY" : "TMRW";
-    const String condition = day == 0 ? weather.todayText : weather.tomorrowText;
     const float high = day == 0 ? weather.todayHigh : weather.tomorrowHigh;
     const float low = day == 0 ? weather.todayLow : weather.tomorrowLow;
     drawWeatherIcon(x + 27, 203, 31, code);
     tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(muted, footer);
-    tft.drawString(label, x + 49, 180, 1);
-    tft.drawString(condition.substring(0, 8), x + 49, 191, 1);
     tft.setTextColor(warm, footer);
     tft.drawString(weather.valid ? String((int)round(high)) : "--", x + 49, 207, 2);
     tft.setTextColor(TFT_LIGHTGREY, footer);
@@ -1797,6 +1803,7 @@ void drawWeatherScreen(bool force) {
     tft.setTextColor(cool, footer);
     tft.drawString(weather.valid ? String((int)round(low)) : "--", x + 87, 207, 2);
   }
+  drawWeatherChineseText();
 }
 
 // ---------- full-screen K-line frame ----------
@@ -2020,6 +2027,7 @@ bool parseStatusJson(const String &payload) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err) return false;
+  bridgeVersion = doc["bridge_version"] | "--";
 
   JsonObject c = doc["claude"];
   if (!c.isNull()) {
@@ -2233,7 +2241,7 @@ String htmlEscape(const String &s) {
 }
 
 void handleRoot() {
-  String age = everPolled ? String((millis() - lastSuccessMs) / 1000) + "s ago" : "never";
+  String age = everPolled ? String((millis() - lastSuccessMs) / 1000) + " 秒前" : "从未";
   String html;
   html.reserve(3072);
   html += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
@@ -2279,10 +2287,25 @@ void handleRoot() {
           "document.getElementById('gifForm').action='/sprite/'+document.getElementById('gifTarget').value;"
           "return true;}</script>";
 
-  html += "<table>";
-  html += "<tr><td>WiFi SSID</td><td>" + htmlEscape(WiFi.SSID()) + "</td></tr>";
+  html += "<h2 style='font-size:16px;margin-top:28px'>设备诊断</h2><table>";
+  html += "<tr><td>Wi-Fi 名称</td><td>" + htmlEscape(WiFi.SSID()) + "</td></tr>";
+  html += "<tr><td>Wi-Fi 信号</td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
   html += "<tr><td>设备 IP</td><td>" + WiFi.localIP().toString() + "</td></tr>";
-  html += "<tr><td>上次桥接更新</td><td>" + age + "</td></tr>";
+  html += "<tr><td>桥接状态</td><td>" + String(wiredActive() ? "在线（USB）" :
+      (everPolled && millis() - lastSuccessMs < 30000UL ? "在线（局域网）" : "离线")) + "</td></tr>";
+  html += "<tr><td>上次数据更新</td><td>" + age + "</td></tr>";
+  html += "<tr><td>固件版本</td><td>" FW_VERSION "</td></tr>";
+  html += "<tr><td>桥接版本</td><td>" + htmlEscape(bridgeVersion) + "</td></tr>";
+  html += "<tr><td>可用内存</td><td>" + String(ESP.getFreeHeap() / 1024UL) + " KB</td></tr>";
+  FSInfo webFsInfo;
+  if (LittleFS.info(webFsInfo)) {
+    html += "<tr><td>文件存储</td><td>" + String(webFsInfo.usedBytes / 1024UL) + " / " +
+            String(webFsInfo.totalBytes / 1024UL) + " KB</td></tr>";
+  }
+  const unsigned long upMinutes = millis() / 60000UL;
+  html += "<tr><td>运行时间</td><td>" + String(upMinutes / 1440UL) + " 天 " +
+          String((upMinutes / 60UL) % 24UL) + " 小时 " + String(upMinutes % 60UL) + " 分</td></tr>";
+  html += "<tr><td>OTA 可用空间</td><td>" + String(ESP.getFreeSketchSpace() / 1024UL) + " KB</td></tr>";
   html += "<tr><td>Claude</td><td>" + htmlEscape(claudeStatus.status) + ", " +
           formatTokens(claudeStatus.tokensToday) + " tok</td></tr>";
   html += "<tr><td>Codex</td><td>" + htmlEscape(codexStatus.status) + ", " +
@@ -2296,6 +2319,14 @@ void handleRoot() {
           "设置并重启？设备会开启配网热点。');\">";
   html += "<button type='submit' style='background:#dc2626'>重置 WiFi</button>";
   html += "</form>";
+
+  html += "<h2 style='font-size:16px;margin-top:32px'>网络 OTA 固件升级</h2>";
+  html += "<p style='font-size:13px;color:#555'>当前版本：<b>" FW_VERSION "</b>。请选择本项目生成的 "
+          "ESP8266 firmware.bin。升级不会清除 Wi-Fi、轮播设置或桌宠文件。上传期间请勿断电。</p>";
+  html += "<form method='POST' action='/update' enctype='multipart/form-data' "
+          "onsubmit=\"return confirm('确认升级固件？上传和重启期间请勿断电。')\">";
+  html += "<input type='file' name='firmware' accept='.bin,application/octet-stream' required>";
+  html += "<button type='submit' style='background:#059669'>上传并升级</button></form>";
 
   html += "</body></html>";
   webServer.send(200, "text/html", html);
@@ -2338,6 +2369,16 @@ void handleApiInfo() {
   doc["brightness"] = brightness;
   doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
   doc["fw"] = FW_VERSION;
+  doc["bridge_version"] = bridgeVersion;
+  doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -127;
+  doc["free_heap"] = ESP.getFreeHeap();
+  doc["uptime_s"] = millis() / 1000UL;
+  doc["ota_space"] = ESP.getFreeSketchSpace();
+  FSInfo fsInfo;
+  if (LittleFS.info(fsInfo)) {
+    doc["fs_used"] = fsInfo.usedBytes;
+    doc["fs_total"] = fsInfo.totalBytes;
+  }
   doc["auto_seconds"] = activeAutoCycleSeconds();
   doc["auto_schedule"] = weatherIsWeekend() ? "weekend" : "weekday";
   JsonArray autoPages = doc["auto_pages"].to<JsonArray>();
@@ -2410,7 +2451,7 @@ void handleApiDisplay() {
   webServer.send(200, "text/plain", "ok");
 }
 
-bool parseAutoPageList(String pages, uint8_t &mask) {
+bool parseAutoPageList(String pages, uint16_t &mask) {
   mask = 0;
   while (pages.length() > 0) {
     int comma = pages.indexOf(',');
@@ -2435,7 +2476,7 @@ void handleApiAutoCycle() {
                                              : webServer.arg("seconds")).toInt();
   const int weekendSeconds = (splitSchedule ? webServer.arg("weekend_seconds")
                                              : webServer.arg("seconds")).toInt();
-  uint8_t weekdayMask = 0, weekendMask = 0;
+  uint16_t weekdayMask = 0, weekendMask = 0;
   if (!parseAutoPageList(weekdayPages, weekdayMask) ||
       !parseAutoPageList(weekendPages, weekendMask)) {
     webServer.send(400, "text/plain", "each schedule needs codex|music|stock|market|weather");
@@ -2485,6 +2526,156 @@ void handleApiBridge() {
   Serial.printf("[api] bridge host = '%s'\n", bridgeHost.c_str());
   webServer.send(200, "text/plain", "ok");
   lastPollMs = 0; // poll the new bridge on the next loop tick
+}
+
+void appendAutoPages(JsonArray pages, uint16_t mask) {
+  for (uint8_t mode = MODE_CODEX; mode <= MODE_WEATHER; ++mode) {
+    if (mask & (1U << mode)) pages.add(displayModeName((DisplayMode)mode));
+  }
+}
+
+void handleApiSettingsGet() {
+  JsonDocument doc;
+  doc["schema"] = 1;
+  doc["firmware"] = FW_VERSION;
+  doc["bridge"] = bridgeHost;
+  doc["mode"] = displayModeName(displayMode);
+  doc["brightness"] = brightness;
+  doc["weekday_seconds"] = weekdayAutoCycleSeconds;
+  appendAutoPages(doc["weekday_pages"].to<JsonArray>(), weekdayAutoPageMask);
+  doc["weekend_seconds"] = weekendAutoCycleSeconds;
+  appendAutoPages(doc["weekend_pages"].to<JsonArray>(), weekendAutoPageMask);
+  String out;
+  serializeJson(doc, out);
+  webServer.send(200, "application/json", out);
+}
+
+bool settingsMask(JsonVariantConst value, uint16_t &mask) {
+  if (!value.is<JsonArrayConst>()) return false;
+  mask = 0;
+  for (JsonVariantConst item : value.as<JsonArrayConst>()) {
+    if (!item.is<const char *>()) return false;
+    String page = item.as<const char *>();
+    if (page == "diag") continue; // migrate short-lived v0.5.9-test backups
+    uint16_t bit = 0;
+    if (!parseAutoPageList(page, bit)) return false;
+    mask |= bit;
+  }
+  if (mask == 0) mask = 1U << MODE_CODEX;
+  return true;
+}
+
+void handleApiSettingsRestore() {
+  const String body = webServer.arg("plain");
+  if (body.length() == 0 || body.length() > 4096) {
+    webServer.send(400, "text/plain", "invalid settings body");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, body) || (doc["schema"] | 0) != 1) {
+    webServer.send(400, "text/plain", "unsupported settings file");
+    return;
+  }
+  uint16_t weekdayMask = 0, weekendMask = 0;
+  const int weekdaySeconds = doc["weekday_seconds"] | 0;
+  const int weekendSeconds = doc["weekend_seconds"] | 0;
+  if (!settingsMask(doc["weekday_pages"], weekdayMask) ||
+      !settingsMask(doc["weekend_pages"], weekendMask) ||
+      !validAutoCycleSeconds(weekdaySeconds) || !validAutoCycleSeconds(weekendSeconds)) {
+    webServer.send(400, "text/plain", "invalid auto schedule");
+    return;
+  }
+  const char *modeValue = doc["mode"] | "auto";
+  String mode(modeValue);
+  DisplayMode restoredMode = MODE_AUTO;
+  if (mode == "codex") restoredMode = MODE_CODEX;
+  else if (mode == "music") restoredMode = MODE_MUSIC;
+  else if (mode == "stock") restoredMode = MODE_STOCK;
+  else if (mode == "market") restoredMode = MODE_MARKET;
+  else if (mode == "weather") restoredMode = MODE_WEATHER;
+  else if (mode == "diag") restoredMode = MODE_CODEX; // no longer a screen page
+  else if (mode != "auto") {
+    webServer.send(400, "text/plain", "invalid display mode");
+    return;
+  }
+
+  String restoredBridge = doc["bridge"] | "";
+  restoredBridge.trim();
+  bridgeHost = restoredBridge;
+  saveBridgeHost(bridgeHost);
+  brightness = constrain(doc["brightness"] | BRIGHTNESS_DEFAULT, 0, 100);
+  applyBrightness();
+  saveBrightness();
+  weekdayAutoPageMask = weekdayMask;
+  weekdayAutoCycleSeconds = weekdaySeconds;
+  weekendAutoPageMask = weekendMask;
+  weekendAutoCycleSeconds = weekendSeconds;
+  saveAutoCycle();
+  displayMode = restoredMode;
+  resetAutoCyclePosition();
+  lastEffectiveMode = MODE_AUTO;
+  webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+bool otaUploadOK = false;
+bool otaUploadStarted = false;
+String otaUploadError;
+unsigned long otaRestartAtMs = 0;
+
+void handleOtaUploadChunk() {
+  HTTPUpload &upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    otaUploadOK = false;
+    otaUploadStarted = true;
+    otaUploadError = "";
+    String filename = upload.filename;
+    filename.toLowerCase();
+    if (!filename.endsWith(".bin")) {
+      otaUploadError = "请选择 ESP8266 firmware.bin 文件";
+      return;
+    }
+    const size_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    if (!Update.begin(maxSketchSpace, U_FLASH)) {
+      otaUploadError = "设备没有足够的 OTA 空间";
+      return;
+    }
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("FIRMWARE UPDATE", SCREEN_CX, 75, 2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Uploading...", SCREEN_CX, 110, 2);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (otaUploadError.length() > 0) return;
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      otaUploadError = "写入固件失败";
+      Update.end(false);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (otaUploadError.length() == 0 && Update.end(true)) {
+      otaUploadOK = true;
+    } else if (otaUploadError.length() == 0) {
+      otaUploadError = "固件校验失败，设备仍保留旧版本";
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.end(false);
+    otaUploadError = "上传已中止";
+  }
+}
+
+void handleOtaUploadDone() {
+  if (!otaUploadStarted || !otaUploadOK) {
+    const String message = otaUploadError.length() ? otaUploadError : "没有收到固件文件";
+    webServer.send(400, "text/plain; charset=utf-8", message);
+    otaUploadStarted = false;
+    return;
+  }
+  webServer.send(200, "text/html; charset=utf-8",
+                 "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+                 "<h2>升级成功</h2><p>设备正在重启。Wi-Fi、轮播设置和桌宠文件会保留。</p>"
+                 "<script>setTimeout(()=>location.href='/',12000)</script>");
+  otaUploadStarted = false;
+  otaRestartAtMs = millis() + 1200UL;
 }
 
 // Streams the animation currently in use for a slot, in the same wire format
@@ -2771,6 +2962,9 @@ void setupWebServer() {
   webServer.on("/api/auto", HTTP_POST, handleApiAutoCycle);
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
   webServer.on("/api/brightness", HTTP_POST, handleApiBrightness);
+  webServer.on("/api/settings", HTTP_GET, handleApiSettingsGet);
+  webServer.on("/api/settings", HTTP_POST, handleApiSettingsRestore);
+  webServer.on("/update", HTTP_POST, handleOtaUploadDone, handleOtaUploadChunk);
   webServer.on("/sprite/claude/reset", HTTP_POST, []() { handleSpriteReset(APP_CLAUDE); });
   webServer.on("/sprite/codex/reset", HTTP_POST, []() { handleSpriteReset(APP_CODEX); });
   webServer.on("/sprite/claude/raw", HTTP_GET, []() { handleSpriteRaw(APP_CLAUDE); });
@@ -2838,6 +3032,9 @@ void loop() {
     lastPollMs = 0; // poll the bridge right away
   }
   if (webServerStarted) webServer.handleClient();
+  if (otaRestartAtMs != 0 && (long)(millis() - otaRestartAtMs) >= 0) {
+    ESP.restart();
+  }
   if (!mainUiShown) return; // config-portal screen is up, nothing to animate
 
   unsigned long nowMs = millis();

@@ -22,6 +22,14 @@ struct DeviceInfo {
     var codexCustomSprite = false
     var claudeW = 111, claudeH = 120
     var codexW = 120, codexH = 120
+    var firmware = ""
+    var bridgeVersion = ""
+    var rssi = -127
+    var freeHeap = 0
+    var uptimeSeconds = 0
+    var otaSpace = 0
+    var fsUsed = 0
+    var fsTotal = 0
 }
 
 final class DeviceClient {
@@ -83,6 +91,14 @@ final class DeviceClient {
                 info.claudeH = (claude?["h"] as? NSNumber)?.intValue ?? 120
                 info.codexW = (codex?["w"] as? NSNumber)?.intValue ?? 120
                 info.codexH = (codex?["h"] as? NSNumber)?.intValue ?? 120
+                info.firmware = obj["fw"] as? String ?? ""
+                info.bridgeVersion = obj["bridge_version"] as? String ?? ""
+                info.rssi = (obj["rssi"] as? NSNumber)?.intValue ?? -127
+                info.freeHeap = (obj["free_heap"] as? NSNumber)?.intValue ?? 0
+                info.uptimeSeconds = (obj["uptime_s"] as? NSNumber)?.intValue ?? 0
+                info.otaSpace = (obj["ota_space"] as? NSNumber)?.intValue ?? 0
+                info.fsUsed = (obj["fs_used"] as? NSNumber)?.intValue ?? 0
+                info.fsTotal = (obj["fs_total"] as? NSNumber)?.intValue ?? 0
                 result = .success(info)
             } else {
                 result = .failure(Self.badResponseError)
@@ -118,6 +134,46 @@ final class DeviceClient {
     /// POST /api/brightness  level=0-100 (0 = backlight off); device persists it
     static func setBrightness(_ level: Int, completion: @escaping (Error?) -> Void) {
         postForm(path: "api/brightness", fields: ["level": String(level)], completion: completion)
+    }
+
+    /// Complete device-side settings used by backup/restore. Wi-Fi credentials
+    /// and custom sprite bytes are deliberately excluded by the firmware.
+    static func fetchSettings(completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        guard let base = baseURL else {
+            completion(.failure(Self.noHostError)); return
+        }
+        var req = URLRequest(url: base.appendingPathComponent("api/settings"))
+        req.timeoutInterval = 8
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            let result: Result<[String: Any], Error>
+            if let error {
+                result = .failure(error)
+            } else if let data,
+                      (response as? HTTPURLResponse)?.statusCode == 200,
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                result = .success(object)
+            } else {
+                result = .failure(Self.badResponseError)
+            }
+            DispatchQueue.main.async { completion(result) }
+        }.resume()
+    }
+
+    static func restoreSettings(_ settings: [String: Any],
+                                completion: @escaping (Error?) -> Void) {
+        guard let base = baseURL else {
+            completion(Self.noHostError); return
+        }
+        guard JSONSerialization.isValidJSONObject(settings),
+              let body = try? JSONSerialization.data(withJSONObject: settings) else {
+            completion(Self.badResponseError); return
+        }
+        var req = URLRequest(url: base.appendingPathComponent("api/settings"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 10
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        run(req, completion: completion)
     }
 
     /// POST /sprite/{claude|codex}  multipart GIF upload — the device decodes
