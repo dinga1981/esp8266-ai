@@ -131,8 +131,8 @@ final class MirrorView: NSView {
     var musicPlaying = false
     var musicCover: CGImage?
 
-    private static let claudeLogo = Bundle.module.image(forResource: "claude-logo")
-    private static let codexLogo = Bundle.module.image(forResource: "codex-logo")
+    private static let claudeLogo = AppResources.bundle.image(forResource: "claude-logo")
+    private static let codexLogo = AppResources.bundle.image(forResource: "codex-logo")
 
     private struct DotGlyph {
         let width: Int
