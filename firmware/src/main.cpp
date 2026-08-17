@@ -478,7 +478,7 @@ int stockNamesDrawnRev = -1;
 // frame buffer. It allocates the compressed frame only during an update,
 // validates the entire envelope and CRC, draws one row at a time through the
 // existing 480-byte rowBuf, then immediately releases the allocation.
-const unsigned long MARKET_POLL_INTERVAL_MS = 1000;
+const unsigned long MARKET_POLL_INTERVAL_MS = 2000;
 const unsigned long MARKET_HTTP_TIMEOUT_MS = 2500;
 const unsigned long MARKET_READ_TIMEOUT_MS = 1200;
 const unsigned long MARKET_TOTAL_TIMEOUT_MS = 5000;
@@ -619,18 +619,40 @@ bool wifiSoftRecoveryDone = false;
 bool wifiHardRecoveryDone = false;
 bool wifiRadioRecoveryDone = false;
 bool webServerNeedsRestart = false;
+const unsigned long WIFI_TRAFFIC_COOLDOWN_MS = 5000UL;
+bool networkTrafficPaused = true;
+unsigned long networkTrafficResumeAtMs = 0;
 
 uint32_t bridgeConsecutiveFailures = 0;
 uint32_t bridgeTotalFailures = 0;
 int lastBridgeHttpCode = 0;
 unsigned long bridgeFailureSinceMs = 0;
 unsigned long lastBridgeSuccessAtMs = 0;
-bool bridgeSoftRecoveryDone = false;
-bool bridgeHardRecoveryDone = false;
 char lastRecoveryAction[56] = "尚未执行";
 unsigned long manualReconnectAtMs = 0;
 
+void pauseNetworkTrafficUntilGotIp() {
+  networkTrafficPaused = true;
+  networkTrafficResumeAtMs = 0;
+}
+
+void startNetworkTrafficCooldown() {
+  networkTrafficPaused = true;
+  networkTrafficResumeAtMs = millis() + WIFI_TRAFFIC_COOLDOWN_MS;
+}
+
+bool networkTrafficReady() {
+  if (WiFi.status() != WL_CONNECTED || networkTrafficResumeAtMs == 0) return false;
+  if (networkTrafficPaused &&
+      (long)(millis() - networkTrafficResumeAtMs) >= 0) {
+    networkTrafficPaused = false;
+    Serial.println("[wifi] network traffic cooldown complete");
+  }
+  return !networkTrafficPaused;
+}
+
 void armRecoveryDisconnect(RecoveryStep step) {
+  pauseNetworkTrafficUntilGotIp();
   pendingDisconnectRecoveryStep = step;
   pendingDisconnectRecoveryAtMs = millis();
 }
@@ -696,8 +718,6 @@ void recordBridgeSuccess() {
   lastBridgeSuccessAtMs = millis();
   bridgeConsecutiveFailures = 0;
   bridgeFailureSinceMs = 0;
-  bridgeSoftRecoveryDone = false;
-  bridgeHardRecoveryDone = false;
   rtcRuntimeDiag.recoveryStep = RECOVERY_NONE;
   rtcRuntimeDiag.bridgeFailures = 0;
   rtcRuntimeDiag.lastBridgeHttpCode = lastBridgeHttpCode;
@@ -767,22 +787,11 @@ void maintainConnectivity(unsigned long nowMs) {
   wifiHardRecoveryDone = false;
   wifiRadioRecoveryDone = false;
 
-  // A bridge outage alone must never cause a reboot: the Mac may simply be
-  // asleep. We make at most one soft and one full Wi-Fi recovery attempt per
-  // failure episode, then keep polling until the bridge returns.
-  if (bridgeFailureSinceMs != 0) {
-    const unsigned long failedFor = nowMs - bridgeFailureSinceMs;
-    if (failedFor >= 30000UL && !bridgeSoftRecoveryDone) {
-      bridgeSoftRecoveryDone = true;
-      setRecoveryAction("桥接失败30秒：尝试快速重连", RECOVERY_QUICK_RECONNECT);
-      armRecoveryDisconnect(RECOVERY_QUICK_RECONNECT);
-      WiFi.reconnect();
-    }
-    if (failedFor >= 90000UL && !bridgeHardRecoveryDone) {
-      bridgeHardRecoveryDone = true;
-      hardReconnectWiFi("桥接失败90秒：重新初始化无线网络");
-    }
-  }
+  // A bridge outage is not a Wi-Fi outage: the Mac may be asleep, the app may
+  // be restarting, or a single HTTP request may have failed. Keep collecting
+  // diagnostics and polling normally, but never reset the radio merely because
+  // the bridge is unavailable. Wi-Fi recovery above is driven only by the
+  // station's actual connection state.
 }
 
 // ---------- backlight brightness ----------
@@ -2538,7 +2547,7 @@ bool fetchMarketFrame(uint64_t expectedVersion, size_t advertisedBytes, bool pal
 }
 
 void pollMarket() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+  if (!networkTrafficReady() || bridgeHost.length() == 0) return;
   WiFiClient client;
   HTTPClient http;
   String url = "http://" + bridgeHost + "/market/version";
@@ -2606,6 +2615,7 @@ void setupWiFi() {
   wifiDisconnectedEventHandler = WiFi.onStationModeDisconnected(
       [](const WiFiEventStationModeDisconnected &event) {
         const unsigned long now = millis();
+        pauseNetworkTrafficUntilGotIp();
         const bool recoveryGenerated = pendingDisconnectRecoveryStep != RECOVERY_NONE &&
             now - pendingDisconnectRecoveryAtMs <= 5000UL;
         wifiDisconnectCount++;
@@ -2645,6 +2655,7 @@ void setupWiFi() {
         wifiOutageActive = false;
         pendingDisconnectRecoveryStep = RECOVERY_NONE;
         pendingDisconnectRecoveryAtMs = 0;
+        startNetworkTrafficCooldown();
         wifiDisconnectedSinceMs = 0;
         wifiSoftRecoveryDone = false;
         wifiHardRecoveryDone = false;
@@ -2656,8 +2667,9 @@ void setupWiFi() {
         writeRtcRuntimeDiag();
         lastPollMs = 0;
         webServerNeedsRestart = webServerStarted;
-        Serial.printf("[wifi] got ip=%s reconnects=%lu\n", event.ip.toString().c_str(),
-                      (unsigned long)wifiReconnectCount);
+        Serial.printf("[wifi] got ip=%s reconnects=%lu; HTTP resumes in %lus\n",
+                      event.ip.toString().c_str(), (unsigned long)wifiReconnectCount,
+                      WIFI_TRAFFIC_COOLDOWN_MS / 1000UL);
       });
   WiFi.setAutoReconnect(true);
   // This clock is continuously powered. Disabling modem sleep avoids a class
@@ -2676,6 +2688,9 @@ void setupWiFi() {
   bool ok = wifiManager.autoConnect(WIFI_PORTAL_AP_NAME);
   WiFi.setAutoReconnect(true);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  if (WiFi.status() == WL_CONNECTED && networkTrafficResumeAtMs == 0) {
+    startNetworkTrafficCooldown();
+  }
   Serial.printf("[wifi] autoConnect result=%d ssid=%s ip=%s\n", ok, WiFi.SSID().c_str(),
                 WiFi.localIP().toString().c_str());
   Serial.printf("[wifi] bridge host = '%s'\n", bridgeHost.c_str());
@@ -2745,7 +2760,7 @@ bool selectEffectivePet(DisplayMode eff) {
 }
 
 void pollBridge() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) {
+  if (!networkTrafficReady() || bridgeHost.length() == 0) {
     Serial.printf("[bridge] skip poll: wifi=%d host='%s'\n", WiFi.status() == WL_CONNECTED, bridgeHost.c_str());
     return;
   }
@@ -3897,6 +3912,13 @@ void loop() {
     Serial.printf("[web] server rebound after Wi-Fi recovery on %s\n", WiFi.localIP().toString().c_str());
   }
   sampleHeapHealth();
+  // Reconnect APIs can report WL_CONNECTED briefly while the SDK is still
+  // leaving/rejoining the AP. Do not start HTTP work in that transition. Once
+  // GotIP fires, wait another five seconds before any bridge or market request.
+  if (!networkTrafficReady()) {
+    delay(0);
+    return;
+  }
   if (!mainUiShown) return; // config-portal screen is up, nothing to animate
 
   unsigned long nowMs = millis();
