@@ -80,6 +80,320 @@ enum DisplayMode {
 };
 DisplayMode displayMode = MODE_AUTO;
 
+// ---------- reset / last-operation diagnostics ----------
+// RTC user memory survives watchdog/software resets (but not necessarily a
+// full power loss), so it can tell us which operation was active immediately
+// before an unexpected restart without writing flash on every network poll.
+enum RuntimeStage : uint8_t {
+  STAGE_BOOT, STAGE_IDLE, STAGE_BRIDGE, STAGE_NET, STAGE_MUSIC, STAGE_STOCK,
+  STAGE_WEATHER, STAGE_MARKET_META, STAGE_MARKET_FRAME, STAGE_WEB,
+  STAGE_WIFI_RECOVERY, STAGE_OTA
+};
+
+enum RecoveryStep : uint8_t {
+  RECOVERY_NONE, RECOVERY_QUICK_RECONNECT, RECOVERY_WIFI_REINIT,
+  RECOVERY_RADIO_RESET, RECOVERY_PROTECTIVE_RESTART, RECOVERY_MANUAL
+};
+
+struct RtcRuntimeDiag {
+  uint32_t magic;
+  uint32_t checksum;
+  uint32_t sequence;
+  uint8_t stage;
+  uint8_t mode;
+  uint8_t wifiStatus;
+  uint8_t recoveryStep;
+  uint8_t firstWifiDisconnectReason;
+  uint8_t lastWifiDisconnectReason;
+  int8_t firstWifiRssi;
+  uint8_t firstWifiChannel;
+  uint8_t firstDisconnectWasRecovery;
+  uint8_t lastDisconnectWasRecovery;
+  uint16_t recoveryMask;
+  uint8_t firstWifiBssid[6];
+  uint8_t reserved[2];
+  uint32_t bridgeFailures;
+  uint32_t wifiDisconnectCount;
+  uint32_t wifiReconnectCount;
+  int32_t lastBridgeHttpCode;
+  uint32_t outageDurationMs;
+  uint32_t quickRecoveryAtMs;
+  uint32_t wifiReinitAtMs;
+  uint32_t radioResetAtMs;
+  uint32_t protectiveRestartAtMs;
+  uint32_t millisAtStage;
+};
+static_assert((sizeof(RtcRuntimeDiag) % 4) == 0, "RTC diagnostics must be word aligned");
+
+const uint32_t RTC_DIAG_MAGIC = 0x4149434CUL; // "AICL"
+// ESP8266 eboot stores its 128-byte OTA copy command at the start of RTC user
+// memory. Diagnostics must begin after word 31 or a stage update between
+// Update.end() and ESP.restart() can silently cancel an otherwise valid OTA.
+const uint32_t RTC_DIAG_WORD_OFFSET = 32;
+const char *BOOT_COUNT_FILE = "/boot_count.txt";
+const char *RESTART_HISTORY_FILE = "/restart_history.bin";
+const uint32_t RESTART_HISTORY_MAGIC = 0x52485331UL; // RHS1
+const uint8_t RESTART_HISTORY_CAPACITY = 4;
+
+struct RestartHistoryEntry {
+  uint32_t bootCount;
+  uint32_t rtcSequence;
+  uint32_t outageDurationMs;
+  uint8_t stage;
+  uint8_t mode;
+  uint8_t recoveryStep;
+  uint8_t firstReason;
+  uint8_t lastReason;
+  uint8_t firstWasRecovery;
+  int8_t firstRssi;
+  uint8_t firstChannel;
+  char resetReason[24];
+};
+
+struct RestartHistoryStore {
+  uint32_t magic;
+  uint32_t checksum;
+  uint8_t count;
+  uint8_t reserved[3];
+  RestartHistoryEntry entries[RESTART_HISTORY_CAPACITY];
+};
+
+RestartHistoryStore restartHistory = {};
+RtcRuntimeDiag rtcRuntimeDiag = {};
+uint8_t previousRuntimeStage = STAGE_BOOT;
+uint8_t previousRuntimeMode = MODE_AUTO;
+uint8_t previousRecoveryStep = RECOVERY_NONE;
+uint8_t previousFirstWifiDisconnectReason = 0;
+uint8_t previousLastWifiDisconnectReason = 0;
+int8_t previousFirstWifiRssi = 0;
+uint8_t previousFirstWifiChannel = 0;
+bool previousFirstDisconnectWasRecovery = false;
+bool previousLastDisconnectWasRecovery = false;
+uint16_t previousRecoveryMask = 0;
+uint8_t previousFirstWifiBssid[6] = {};
+uint32_t previousBridgeFailures = 0;
+uint32_t previousWifiDisconnectCount = 0;
+uint32_t previousWifiReconnectCount = 0;
+int32_t previousBridgeHttpCode = 0;
+uint32_t previousOutageDurationMs = 0;
+uint32_t previousQuickRecoveryAtMs = 0;
+uint32_t previousWifiReinitAtMs = 0;
+uint32_t previousRadioResetAtMs = 0;
+uint32_t previousProtectiveRestartAtMs = 0;
+uint8_t diagnosticEffectiveMode = MODE_AUTO;
+uint32_t bootCount = 0;
+char lastResetReason[32] = "Unknown";
+char lastResetInfo[200] = "Unknown";
+
+uint32_t rtcDiagChecksum(const RtcRuntimeDiag &value) {
+  RtcRuntimeDiag copy = value;
+  copy.checksum = 0;
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&copy);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < sizeof(copy); ++i) {
+    hash ^= bytes[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+uint32_t restartHistoryChecksum(const RestartHistoryStore &value) {
+  RestartHistoryStore copy = value;
+  copy.checksum = 0;
+  const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&copy);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < sizeof(copy); ++i) { hash ^= bytes[i]; hash *= 16777619UL; }
+  return hash;
+}
+
+void loadRestartHistory() {
+  File f = LittleFS.open(RESTART_HISTORY_FILE, "r");
+  if (!f || f.size() != sizeof(restartHistory) ||
+      f.read(reinterpret_cast<uint8_t *>(&restartHistory), sizeof(restartHistory)) !=
+          sizeof(restartHistory) || restartHistory.magic != RESTART_HISTORY_MAGIC ||
+      restartHistory.count > RESTART_HISTORY_CAPACITY ||
+      restartHistory.checksum != restartHistoryChecksum(restartHistory)) {
+    restartHistory = {};
+  }
+  if (f) f.close();
+}
+
+void appendRestartHistory(const RtcRuntimeDiag &previous) {
+  for (int i = RESTART_HISTORY_CAPACITY - 1; i > 0; --i) {
+    restartHistory.entries[i] = restartHistory.entries[i - 1];
+  }
+  RestartHistoryEntry &entry = restartHistory.entries[0];
+  entry = {};
+  entry.bootCount = bootCount;
+  entry.rtcSequence = previous.sequence;
+  entry.outageDurationMs = previous.outageDurationMs;
+  entry.stage = previous.stage;
+  entry.mode = previous.mode;
+  entry.recoveryStep = previous.recoveryStep;
+  entry.firstReason = previous.firstWifiDisconnectReason;
+  entry.lastReason = previous.lastWifiDisconnectReason;
+  entry.firstWasRecovery = previous.firstDisconnectWasRecovery;
+  entry.firstRssi = previous.firstWifiRssi;
+  entry.firstChannel = previous.firstWifiChannel;
+  strlcpy(entry.resetReason, lastResetReason, sizeof(entry.resetReason));
+  restartHistory.count = min((uint8_t)(restartHistory.count + 1), RESTART_HISTORY_CAPACITY);
+  restartHistory.magic = RESTART_HISTORY_MAGIC;
+  restartHistory.checksum = restartHistoryChecksum(restartHistory);
+  File f = LittleFS.open(RESTART_HISTORY_FILE, "w");
+  if (f) {
+    f.write(reinterpret_cast<const uint8_t *>(&restartHistory), sizeof(restartHistory));
+    f.close();
+  }
+}
+
+const char *runtimeStageName(uint8_t stage) {
+  switch (stage) {
+    case STAGE_BOOT: return "启动";
+    case STAGE_IDLE: return "空闲";
+    case STAGE_BRIDGE: return "桥接状态请求";
+    case STAGE_NET: return "网速请求";
+    case STAGE_MUSIC: return "音乐请求";
+    case STAGE_STOCK: return "四行行情请求";
+    case STAGE_WEATHER: return "天气请求";
+    case STAGE_MARKET_META: return "K线元数据请求";
+    case STAGE_MARKET_FRAME: return "K线帧请求";
+    case STAGE_WEB: return "设备网页";
+    case STAGE_WIFI_RECOVERY: return "Wi-Fi恢复";
+    case STAGE_OTA: return "OTA升级";
+    default: return "未知";
+  }
+}
+
+const char *runtimeModeName(uint8_t mode) {
+  switch (mode) {
+    case MODE_AUTO: return "自动";
+    case MODE_CLAUDE: return "Claude";
+    case MODE_CODEX: return "Codex";
+    case MODE_NET: return "网速";
+    case MODE_MUSIC: return "音乐";
+    case MODE_STOCK: return "四行报价";
+    case MODE_MARKET: return "K线行情";
+    case MODE_WEATHER: return "天气";
+    default: return "未知";
+  }
+}
+
+const char *wifiStatusName(uint8_t status) {
+  switch (status) {
+    case WL_CONNECTED: return "已连接";
+    case WL_NO_SSID_AVAIL: return "找不到Wi-Fi";
+    case WL_CONNECT_FAILED: return "连接失败";
+    case WL_CONNECTION_LOST: return "连接丢失";
+    case WL_DISCONNECTED: return "已断开";
+    case WL_IDLE_STATUS: return "连接中";
+    default: return "未知";
+  }
+}
+
+const char *recoveryStepName(uint8_t step) {
+  switch (step) {
+    case RECOVERY_QUICK_RECONNECT: return "快速重连";
+    case RECOVERY_WIFI_REINIT: return "重新初始化无线网络";
+    case RECOVERY_RADIO_RESET: return "射频关闭/唤醒";
+    case RECOVERY_PROTECTIVE_RESTART: return "保护性重启";
+    case RECOVERY_MANUAL: return "用户手动重连";
+    default: return "无";
+  }
+}
+
+const char *disconnectOriginName(bool recoveryGenerated) {
+  return recoveryGenerated ? "固件恢复动作" : "外部/AP/协议栈";
+}
+
+String disconnectEventText(uint8_t reason, bool recoveryGenerated) {
+  if (reason == 0) return "无记录";
+  return String((unsigned)reason) + "（" + disconnectOriginName(recoveryGenerated) + "）";
+}
+
+String wifiBssidText(const uint8_t *bssid) {
+  char value[18];
+  snprintf(value, sizeof(value), "%02X:%02X:%02X:%02X:%02X:%02X",
+           bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+  return String(value);
+}
+
+String recoveryTimelineText(uint32_t quick, uint32_t reinit,
+                            uint32_t radio, uint32_t restart) {
+  String value = "快速:";
+  value += quick ? String(quick / 1000UL) + "s" : "--";
+  value += " 重置:";
+  value += reinit ? String(reinit / 1000UL) + "s" : "--";
+  value += " 射频:";
+  value += radio ? String(radio / 1000UL) + "s" : "--";
+  value += " 重启:";
+  value += restart ? String(restart / 1000UL) + "s" : "--";
+  return value;
+}
+
+void writeRtcRuntimeDiag() {
+  rtcRuntimeDiag.magic = RTC_DIAG_MAGIC;
+  rtcRuntimeDiag.checksum = rtcDiagChecksum(rtcRuntimeDiag);
+  ESP.rtcUserMemoryWrite(RTC_DIAG_WORD_OFFSET, reinterpret_cast<uint32_t *>(&rtcRuntimeDiag),
+                         sizeof(rtcRuntimeDiag));
+}
+
+void saveRuntimeStage(RuntimeStage stage) {
+  if (rtcRuntimeDiag.stage == stage && rtcRuntimeDiag.mode == diagnosticEffectiveMode &&
+      rtcRuntimeDiag.wifiStatus == (uint8_t)WiFi.status()) return;
+  rtcRuntimeDiag.stage = stage;
+  rtcRuntimeDiag.mode = diagnosticEffectiveMode;
+  rtcRuntimeDiag.wifiStatus = (uint8_t)WiFi.status();
+  rtcRuntimeDiag.millisAtStage = millis();
+  writeRtcRuntimeDiag();
+}
+
+void loadBootDiagnostics() {
+  strlcpy(lastResetReason, ESP.getResetReason().c_str(), sizeof(lastResetReason));
+  strlcpy(lastResetInfo, ESP.getResetInfo().c_str(), sizeof(lastResetInfo));
+
+  RtcRuntimeDiag previous = {};
+  const bool previousValid = ESP.rtcUserMemoryRead(
+      RTC_DIAG_WORD_OFFSET, reinterpret_cast<uint32_t *>(&previous),
+                            sizeof(previous)) &&
+      previous.magic == RTC_DIAG_MAGIC && previous.checksum == rtcDiagChecksum(previous);
+  if (previousValid) {
+    previousRuntimeStage = previous.stage;
+    previousRuntimeMode = previous.mode;
+    previousRecoveryStep = previous.recoveryStep;
+    previousFirstWifiDisconnectReason = previous.firstWifiDisconnectReason;
+    previousLastWifiDisconnectReason = previous.lastWifiDisconnectReason;
+    previousFirstWifiRssi = previous.firstWifiRssi;
+    previousFirstWifiChannel = previous.firstWifiChannel;
+    previousFirstDisconnectWasRecovery = previous.firstDisconnectWasRecovery != 0;
+    previousLastDisconnectWasRecovery = previous.lastDisconnectWasRecovery != 0;
+    previousRecoveryMask = previous.recoveryMask;
+    memcpy(previousFirstWifiBssid, previous.firstWifiBssid, sizeof(previousFirstWifiBssid));
+    previousBridgeFailures = previous.bridgeFailures;
+    previousWifiDisconnectCount = previous.wifiDisconnectCount;
+    previousWifiReconnectCount = previous.wifiReconnectCount;
+    previousBridgeHttpCode = previous.lastBridgeHttpCode;
+    previousOutageDurationMs = previous.outageDurationMs;
+    previousQuickRecoveryAtMs = previous.quickRecoveryAtMs;
+    previousWifiReinitAtMs = previous.wifiReinitAtMs;
+    previousRadioResetAtMs = previous.radioResetAtMs;
+    previousProtectiveRestartAtMs = previous.protectiveRestartAtMs;
+    rtcRuntimeDiag.sequence = previous.sequence + 1;
+  } else {
+    rtcRuntimeDiag.sequence = 1;
+  }
+
+  if (LittleFS.exists(BOOT_COUNT_FILE)) {
+    File f = LittleFS.open(BOOT_COUNT_FILE, "r");
+    if (f) { bootCount = (uint32_t)f.readString().toInt(); f.close(); }
+  }
+  bootCount++;
+  File f = LittleFS.open(BOOT_COUNT_FILE, "w");
+  if (f) { f.print(bootCount); f.close(); }
+  loadRestartHistory();
+  if (previousValid) appendRestartHistory(previous);
+  saveRuntimeStage(STAGE_BOOT);
+}
+
 // AUTO is a user-configurable carousel. Bit N selects DisplayMode N; AUTO
 // itself is never a carousel page. Default preserves the original two-pet
 // experience until the user changes it from the Mac menu.
@@ -139,7 +453,9 @@ const unsigned long MUSIC_POLL_INTERVAL_MS = 2000;
 const unsigned long STOCK_POLL_INTERVAL_MS = 5000;
 const int MAX_STOCKS = 4;
 struct StockRow {
-  String code, price, pct;
+  char code[16] = "";
+  char price[16] = "";
+  char pct[12] = "";
   int up = 0; // 1 rising (red, CN convention) / -1 falling (green) / 0 flat
 };
 StockRow stocks[MAX_STOCKS];
@@ -147,8 +463,8 @@ int stockCount = 0;
 bool stockEverLoaded = false;
 bool stockDirty = false;
 bool stockChromeDrawn = false;
-String stockLastCode[MAX_STOCKS]; // top line (code + CJK name strip)
-String stockLastVal[MAX_STOCKS];  // value line (price + pct)
+uint32_t stockLastCodeHash[MAX_STOCKS] = {}; // top line (code + CJK name strip)
+uint32_t stockLastValHash[MAX_STOCKS] = {};  // value line (price + pct + direction)
 unsigned long lastStockPollMs = 0;
 // CJK names come as Mac-rendered RGB565 strips (GET /stock/names.raw, one
 // 156x16 strip per row) - names_rev says when to re-fetch. -1 = not drawn.
@@ -168,9 +484,13 @@ const unsigned long MARKET_READ_TIMEOUT_MS = 1200;
 const unsigned long MARKET_TOTAL_TIMEOUT_MS = 5000;
 const size_t MARKET_PACKED_HEADER_BYTES = 20;
 const size_t MARKET_PACKED_MAX_BYTES = 30 * 1024;
+const uint16_t MARKET_PALETTE_RGB565[16] PROGMEM = {
+  0x0000, 0xFFFF, 0xC618, 0x7BEF, 0x39E7, 0x18C3, 0xF800, 0x07E0,
+  0xFBE7, 0x37E7, 0xFFE0, 0xFD20, 0x07FF, 0x001F, 0xF81F, 0x8410
+};
 unsigned long lastMarketPollMs = 0;
 uint64_t lastMarketFrameVersion = 0;
-String lastMarketFrameSession;
+char lastMarketFrameSession[40] = "";
 bool marketAutoDwellKnown = false;
 unsigned long marketAutoDwellMs = 0;
 
@@ -193,7 +513,8 @@ unsigned long lastWeatherClockMs = 0;
 bool weatherChromeDrawn = false;
 bool weatherDirty = false;
 
-String musicTitle, musicArtist, musicAlbum;
+char musicTitle[72] = "";
+char musicArtist[48] = "";
 bool musicPlaying = false;
 int musicElapsed = 0, musicDuration = 0;
 int musicArtworkRev = -1;
@@ -212,10 +533,10 @@ unsigned long lastFlashMs = 0;
 // Bridge host is not asked for during first-time WiFi setup: the Mac/Windows
 // bridge discovers the device and pairs automatically (or set via /api/bridge).
 String bridgeHost;
-String bridgeVersion = "--";
+char bridgeVersion[24] = "--";
 
 struct ClaudeStatus {
-  String status = "unknown";
+  char status[16] = "unknown";
   long tokensToday = 0;
   int sessionMin = 0;
   int sessionWindowMin = 300;
@@ -227,7 +548,7 @@ struct ClaudeStatus {
 };
 
 struct CodexStatus {
-  String status = "unknown";
+  char status[16] = "unknown";
   long tokensToday = 0;
   float primaryPct = -1;
   int primaryResetMin = -1;
@@ -246,6 +567,223 @@ unsigned long lastSuccessMs = 0;
 bool everPolled = false;
 bool mainUiShown = false;      // false while the config-portal screen is up
 bool webServerStarted = false; // deferred: port 80 clashes with the portal
+
+// Heap health is sampled from the normal loop, outside the diagnostic web
+// request. This keeps the admin page's own temporary allocations out of the
+// displayed "current" value and makes long-term fragmentation visible.
+uint32_t idleFreeHeap = 0;
+uint32_t minimumIdleFreeHeap = 0;
+uint32_t idleMaxFreeBlock = 0;
+uint8_t idleHeapFragmentation = 0;
+unsigned long lastHeapSampleMs = 0;
+
+void sampleHeapHealth(bool force = false) {
+  const unsigned long now = millis();
+  if (!force && now - lastHeapSampleMs < 1000UL) return;
+  lastHeapSampleMs = now;
+  idleFreeHeap = ESP.getFreeHeap();
+  idleMaxFreeBlock = ESP.getMaxFreeBlockSize();
+  idleHeapFragmentation = ESP.getHeapFragmentation();
+  if (minimumIdleFreeHeap == 0 || idleFreeHeap < minimumIdleFreeHeap) {
+    minimumIdleFreeHeap = idleFreeHeap;
+  }
+}
+
+// ---------- Wi-Fi / bridge recovery diagnostics ----------
+WiFiEventHandler wifiDisconnectedEventHandler;
+WiFiEventHandler wifiGotIpEventHandler;
+uint32_t wifiDisconnectCount = 0;
+uint32_t wifiReconnectCount = 0;
+uint8_t firstWifiDisconnectReason = 0;
+uint8_t lastWifiDisconnectReason = 0;
+int8_t firstWifiDisconnectRssi = 0;
+uint8_t firstWifiDisconnectChannel = 0;
+uint8_t firstWifiDisconnectBssid[6] = {};
+bool firstDisconnectWasRecovery = false;
+bool lastDisconnectWasRecovery = false;
+bool wifiOutageActive = false;
+uint16_t wifiRecoveryMask = 0;
+uint32_t lastWifiOutageDurationMs = 0;
+uint32_t quickRecoveryAtMs = 0;
+uint32_t wifiReinitAtMs = 0;
+uint32_t radioResetAtMs = 0;
+uint32_t protectiveRestartAtMs = 0;
+int8_t lastConnectedWifiRssi = 0;
+uint8_t lastConnectedWifiChannel = 0;
+uint8_t lastConnectedWifiBssid[6] = {};
+RecoveryStep pendingDisconnectRecoveryStep = RECOVERY_NONE;
+unsigned long pendingDisconnectRecoveryAtMs = 0;
+unsigned long wifiDisconnectedSinceMs = 0;
+bool wifiEverGotIp = false;
+bool wifiSoftRecoveryDone = false;
+bool wifiHardRecoveryDone = false;
+bool wifiRadioRecoveryDone = false;
+bool webServerNeedsRestart = false;
+
+uint32_t bridgeConsecutiveFailures = 0;
+uint32_t bridgeTotalFailures = 0;
+int lastBridgeHttpCode = 0;
+unsigned long bridgeFailureSinceMs = 0;
+unsigned long lastBridgeSuccessAtMs = 0;
+bool bridgeSoftRecoveryDone = false;
+bool bridgeHardRecoveryDone = false;
+char lastRecoveryAction[56] = "尚未执行";
+unsigned long manualReconnectAtMs = 0;
+
+void armRecoveryDisconnect(RecoveryStep step) {
+  pendingDisconnectRecoveryStep = step;
+  pendingDisconnectRecoveryAtMs = millis();
+}
+
+void sampleConnectedWifiEvidence() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  lastConnectedWifiRssi = (int8_t)constrain(WiFi.RSSI(), -127, 0);
+  lastConnectedWifiChannel = (uint8_t)WiFi.channel();
+  const uint8_t *bssid = WiFi.BSSID();
+  if (bssid) memcpy(lastConnectedWifiBssid, bssid, sizeof(lastConnectedWifiBssid));
+}
+
+uint32_t currentWifiOutageDurationMs() {
+  return wifiDisconnectedSinceMs == 0 ? lastWifiOutageDurationMs
+                                      : millis() - wifiDisconnectedSinceMs;
+}
+
+void syncWifiEvidenceToRtc() {
+  rtcRuntimeDiag.firstWifiDisconnectReason = firstWifiDisconnectReason;
+  rtcRuntimeDiag.lastWifiDisconnectReason = lastWifiDisconnectReason;
+  rtcRuntimeDiag.firstWifiRssi = firstWifiDisconnectRssi;
+  rtcRuntimeDiag.firstWifiChannel = firstWifiDisconnectChannel;
+  rtcRuntimeDiag.firstDisconnectWasRecovery = firstDisconnectWasRecovery ? 1 : 0;
+  rtcRuntimeDiag.lastDisconnectWasRecovery = lastDisconnectWasRecovery ? 1 : 0;
+  rtcRuntimeDiag.recoveryMask = wifiRecoveryMask;
+  memcpy(rtcRuntimeDiag.firstWifiBssid, firstWifiDisconnectBssid,
+         sizeof(rtcRuntimeDiag.firstWifiBssid));
+  rtcRuntimeDiag.outageDurationMs = currentWifiOutageDurationMs();
+  rtcRuntimeDiag.quickRecoveryAtMs = quickRecoveryAtMs;
+  rtcRuntimeDiag.wifiReinitAtMs = wifiReinitAtMs;
+  rtcRuntimeDiag.radioResetAtMs = radioResetAtMs;
+  rtcRuntimeDiag.protectiveRestartAtMs = protectiveRestartAtMs;
+}
+
+void persistRecoverySnapshot(RecoveryStep step) {
+  rtcRuntimeDiag.stage = STAGE_WIFI_RECOVERY;
+  rtcRuntimeDiag.mode = diagnosticEffectiveMode;
+  rtcRuntimeDiag.wifiStatus = (uint8_t)WiFi.status();
+  rtcRuntimeDiag.recoveryStep = (uint8_t)step;
+  const uint32_t elapsed = wifiDisconnectedSinceMs == 0 ? 0
+                                                        : millis() - wifiDisconnectedSinceMs;
+  wifiRecoveryMask |= (uint16_t)(1U << (uint8_t)step);
+  if (step == RECOVERY_QUICK_RECONNECT) quickRecoveryAtMs = elapsed;
+  else if (step == RECOVERY_WIFI_REINIT || step == RECOVERY_MANUAL) wifiReinitAtMs = elapsed;
+  else if (step == RECOVERY_RADIO_RESET) radioResetAtMs = elapsed;
+  else if (step == RECOVERY_PROTECTIVE_RESTART) protectiveRestartAtMs = elapsed;
+  syncWifiEvidenceToRtc();
+  rtcRuntimeDiag.bridgeFailures = bridgeConsecutiveFailures;
+  rtcRuntimeDiag.wifiDisconnectCount = wifiDisconnectCount;
+  rtcRuntimeDiag.wifiReconnectCount = wifiReconnectCount;
+  rtcRuntimeDiag.lastBridgeHttpCode = lastBridgeHttpCode;
+  rtcRuntimeDiag.millisAtStage = millis();
+  writeRtcRuntimeDiag();
+}
+
+void setRecoveryAction(const char *action, RecoveryStep step) {
+  strlcpy(lastRecoveryAction, action, sizeof(lastRecoveryAction));
+  Serial.printf("[recovery] %s\n", lastRecoveryAction);
+  persistRecoverySnapshot(step);
+}
+
+void recordBridgeSuccess() {
+  lastBridgeSuccessAtMs = millis();
+  bridgeConsecutiveFailures = 0;
+  bridgeFailureSinceMs = 0;
+  bridgeSoftRecoveryDone = false;
+  bridgeHardRecoveryDone = false;
+  rtcRuntimeDiag.recoveryStep = RECOVERY_NONE;
+  rtcRuntimeDiag.bridgeFailures = 0;
+  rtcRuntimeDiag.lastBridgeHttpCode = lastBridgeHttpCode;
+}
+
+void recordBridgeFailure(int code) {
+  lastBridgeHttpCode = code;
+  bridgeConsecutiveFailures++;
+  bridgeTotalFailures++;
+  rtcRuntimeDiag.bridgeFailures = bridgeConsecutiveFailures;
+  rtcRuntimeDiag.lastBridgeHttpCode = lastBridgeHttpCode;
+  if (bridgeFailureSinceMs == 0) bridgeFailureSinceMs = max(millis(), 1UL);
+}
+
+void hardReconnectWiFi(const char *reason, RecoveryStep step = RECOVERY_WIFI_REINIT) {
+  setRecoveryAction(reason, step);
+  armRecoveryDisconnect(step);
+  WiFi.disconnect(false);
+  WiFi.begin();
+  webServerNeedsRestart = webServerStarted;
+}
+
+void resetWiFiRadio(const char *reason) {
+  setRecoveryAction(reason, RECOVERY_RADIO_RESET);
+  armRecoveryDisconnect(RECOVERY_RADIO_RESET);
+  WiFi.forceSleepBegin();
+  delay(30);
+  WiFi.forceSleepWake();
+  delay(30);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.begin();
+  webServerNeedsRestart = webServerStarted;
+}
+
+void maintainConnectivity(unsigned long nowMs) {
+  if (!wifiEverGotIp && bridgeHost.length() == 0) return; // first-time config portal owns Wi-Fi
+  sampleConnectedWifiEvidence();
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiDisconnectedSinceMs == 0) wifiDisconnectedSinceMs = max(nowMs, 1UL);
+    const unsigned long downFor = nowMs - wifiDisconnectedSinceMs;
+    if (downFor >= 15000UL && !wifiSoftRecoveryDone) {
+      wifiSoftRecoveryDone = true;
+      setRecoveryAction("Wi-Fi断线15秒：尝试快速重连", RECOVERY_QUICK_RECONNECT);
+      armRecoveryDisconnect(RECOVERY_QUICK_RECONNECT);
+      WiFi.reconnect();
+    }
+    if (downFor >= 60000UL && !wifiHardRecoveryDone) {
+      wifiHardRecoveryDone = true;
+      hardReconnectWiFi("Wi-Fi断线60秒：重新初始化无线网络");
+    }
+    if (downFor >= 180000UL && !wifiRadioRecoveryDone) {
+      wifiRadioRecoveryDone = true;
+      resetWiFiRadio("Wi-Fi断线3分钟：关闭并唤醒无线射频");
+    }
+    if (downFor >= 300000UL) {
+      setRecoveryAction("Wi-Fi断线5分钟：保护性重启", RECOVERY_PROTECTIVE_RESTART);
+      delay(20);
+      ESP.restart();
+    }
+    return;
+  }
+
+  wifiDisconnectedSinceMs = 0;
+  wifiSoftRecoveryDone = false;
+  wifiHardRecoveryDone = false;
+  wifiRadioRecoveryDone = false;
+
+  // A bridge outage alone must never cause a reboot: the Mac may simply be
+  // asleep. We make at most one soft and one full Wi-Fi recovery attempt per
+  // failure episode, then keep polling until the bridge returns.
+  if (bridgeFailureSinceMs != 0) {
+    const unsigned long failedFor = nowMs - bridgeFailureSinceMs;
+    if (failedFor >= 30000UL && !bridgeSoftRecoveryDone) {
+      bridgeSoftRecoveryDone = true;
+      setRecoveryAction("桥接失败30秒：尝试快速重连", RECOVERY_QUICK_RECONNECT);
+      armRecoveryDisconnect(RECOVERY_QUICK_RECONNECT);
+      WiFi.reconnect();
+    }
+    if (failedFor >= 90000UL && !bridgeHardRecoveryDone) {
+      bridgeHardRecoveryDone = true;
+      hardReconnectWiFi("桥接失败90秒：重新初始化无线网络");
+    }
+  }
+}
 
 // ---------- backlight brightness ----------
 // The panel backlight (TFT_BL, active LOW) is PWM-dimmable — the vendor's own
@@ -1064,8 +1602,8 @@ bool updateActiveApp() {
   } else if (codexStatus.needsInput && !claudeStatus.needsInput) {
     desired = APP_CODEX;
   } else {
-    bool claudeWorking = claudeStatus.status == "working";
-    bool codexWorking = codexStatus.status == "working";
+    bool claudeWorking = strcmp(claudeStatus.status, "working") == 0;
+    bool codexWorking = strcmp(codexStatus.status, "working") == 0;
     if (claudeWorking && !codexWorking) {
       desired = APP_CLAUDE;
     } else if (codexWorking && !claudeWorking) {
@@ -1293,9 +1831,7 @@ void netDrawTick() {
 // Ingests one /net payload (from HTTP polling or a serial #NET frame) into
 // the sample queue. The seq field tells us which samples we've already
 // queued, so overlapping tails are fine.
-bool handleNetPayload(const String &payload) {
-  JsonDocument doc;
-  if (deserializeJson(doc, payload)) return false;
+bool applyNetJson(JsonDocument &doc) {
   netCurRx = doc["rx_bps"] | 0L;
   netCurTx = doc["tx_bps"] | 0L;
   netCpuPct = doc["cpu_pct"] | -1;
@@ -1318,6 +1854,11 @@ bool handleNetPayload(const String &payload) {
   return true;
 }
 
+bool handleNetPayload(const String &payload) {
+  JsonDocument doc;
+  return !deserializeJson(doc, payload) && applyNetJson(doc);
+}
+
 // Refills the sample queue from the bridge's /net endpoint.
 void pollNet() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
@@ -1327,7 +1868,10 @@ void pollNet() {
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
   if (!http.begin(client, url)) return;
   int code = http.GET();
-  if (code == HTTP_CODE_OK) handleNetPayload(http.getString());
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, *http.getStreamPtr())) applyNetJson(doc);
+  }
   http.end();
 }
 
@@ -1422,7 +1966,7 @@ void drawMusicTextFallback() {
   tft.fillRect(MUSIC_TEXT_X, MUSIC_TEXT_Y, MUSIC_TEXT_W, MUSIC_TEXT_H, TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  String title = musicTitle.length() ? musicTitle : "No Music";
+  String title = musicTitle[0] ? musicTitle : "No Music";
   tft.drawString(fitText(title, 216, 2), SCREEN_CX, MUSIC_TEXT_Y + 4, 2);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
   tft.drawString(fitText(musicArtist, 216, 2), SCREEN_CX, MUSIC_TEXT_Y + 24, 2);
@@ -1468,10 +2012,9 @@ void pollMusic() {
   int code = http.GET();
   if (code == HTTP_CODE_OK) {
     JsonDocument doc;
-    if (!deserializeJson(doc, http.getString())) {
-      musicTitle = doc["title"] | "";
-      musicArtist = doc["artist"] | "";
-      musicAlbum = doc["album"] | "";
+    if (!deserializeJson(doc, *http.getStreamPtr())) {
+      strlcpy(musicTitle, doc["title"] | "", sizeof(musicTitle));
+      strlcpy(musicArtist, doc["artist"] | "", sizeof(musicArtist));
       musicPlaying = doc["playing"] | false;
       statusMusicPlaying = musicPlaying; // fast stop-detection while music shows
       musicElapsed = doc["elapsed"] | 0;
@@ -1491,16 +2034,14 @@ void pollMusic() {
 
 // ---------- stock watchlist screen ----------
 
-bool handleStockPayload(const String &payload) {
-  JsonDocument doc;
-  if (deserializeJson(doc, payload)) return false;
+bool applyStockJson(JsonDocument &doc) {
   JsonArray arr = doc["stocks"];
   stockCount = 0;
   for (JsonObject s : arr) {
     if (stockCount >= MAX_STOCKS) break;
-    stocks[stockCount].code = s["code"] | "";
-    stocks[stockCount].price = s["price"] | "";
-    stocks[stockCount].pct = s["pct"] | "";
+    strlcpy(stocks[stockCount].code, s["code"] | "", sizeof(stocks[stockCount].code));
+    strlcpy(stocks[stockCount].price, s["price"] | "", sizeof(stocks[stockCount].price));
+    strlcpy(stocks[stockCount].pct, s["pct"] | "", sizeof(stocks[stockCount].pct));
     stocks[stockCount].up = s["up"] | 0;
     stockCount++;
   }
@@ -1508,6 +2049,19 @@ bool handleStockPayload(const String &payload) {
   stockEverLoaded = true;
   stockDirty = true;
   return true;
+}
+
+bool handleStockPayload(const String &payload) {
+  JsonDocument doc;
+  return !deserializeJson(doc, payload) && applyStockJson(doc);
+}
+
+uint32_t stockHashAppend(uint32_t hash, const char *text) {
+  while (*text) {
+    hash ^= (uint8_t)*text++;
+    hash *= 16777619UL;
+  }
+  return hash;
 }
 
 // Streams the Mac-rendered name strips and blits one per row (top line,
@@ -1555,7 +2109,10 @@ void pollStock() {
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
   if (!http.begin(client, url)) return;
   int code = http.GET();
-  if (code == HTTP_CODE_OK) handleStockPayload(http.getString());
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, *http.getStreamPtr())) applyStockJson(doc);
+  }
   http.end();
 }
 
@@ -1567,8 +2124,8 @@ void drawStockScreen() {
     tft.fillScreen(TFT_BLACK);
     stockChromeDrawn = true;
     for (int i = 0; i < MAX_STOCKS; i++) {
-      stockLastCode[i] = "\x01"; // force repaint
-      stockLastVal[i] = "\x01";
+      stockLastCodeHash[i] = UINT32_MAX; // force repaint
+      stockLastValHash[i] = UINT32_MAX;
     }
     stockNamesDrawnRev = -1;
     tft.setTextDatum(TC_DATUM);
@@ -1578,10 +2135,10 @@ void drawStockScreen() {
   stockDirty = false;
 
   if (stockCount == 0) {
-    if (stockLastCode[0] != "") {
+    if (stockLastCodeHash[0] != 0) {
       for (int i = 0; i < MAX_STOCKS; i++) {
-        stockLastCode[i] = "";
-        stockLastVal[i] = "";
+        stockLastCodeHash[i] = 0;
+        stockLastValHash[i] = 0;
       }
       tft.fillRect(0, 0, SCREEN_W, 226, TFT_BLACK);
       tft.setTextDatum(TC_DATUM);
@@ -1597,9 +2154,9 @@ void drawStockScreen() {
     bool has = i < stockCount;
     // top line (code + name strip) and value line refresh independently, so
     // a price tick never wipes the name bitmap
-    String codeKey = has ? stocks[i].code : "";
-    if (codeKey != stockLastCode[i]) {
-      stockLastCode[i] = codeKey;
+    const uint32_t codeHash = has ? stockHashAppend(2166136261UL, stocks[i].code) : 0;
+    if (codeHash != stockLastCodeHash[i]) {
+      stockLastCodeHash[i] = codeHash;
       tft.fillRect(0, y0, SCREEN_W, 17, TFT_BLACK);
       stockNamesDrawnRev = -1; // strip area wiped: re-fetch names
       if (has) {
@@ -1608,9 +2165,15 @@ void drawStockScreen() {
         tft.drawString(stocks[i].code, 14, y0, 2);
       }
     }
-    String valKey = has ? stocks[i].price + "|" + stocks[i].pct + "|" + String(stocks[i].up) : "";
-    if (valKey != stockLastVal[i]) {
-      stockLastVal[i] = valKey;
+    uint32_t valHash = 0;
+    if (has) {
+      valHash = stockHashAppend(2166136261UL, stocks[i].price);
+      valHash = stockHashAppend(valHash, stocks[i].pct);
+      valHash ^= (uint8_t)(stocks[i].up + 1);
+      valHash *= 16777619UL;
+    }
+    if (valHash != stockLastValHash[i]) {
+      stockLastValHash[i] = valHash;
       tft.fillRect(0, y0 + 18, SCREEN_W, 36, TFT_BLACK); // value line + inter-row gap
       if (has) {
         tft.setTextDatum(TL_DATUM);
@@ -1632,9 +2195,7 @@ void drawStockScreen() {
 
 // ---------- date + weather screen ----------
 
-bool handleWeatherPayload(const String &payload) {
-  JsonDocument doc;
-  if (deserializeJson(doc, payload)) return false;
+bool applyWeatherJson(JsonDocument &doc) {
   const time_t serverUnix = doc["server_unix"] | (time_t)0;
   if (serverUnix > 0) {
     weather.serverUnix = serverUnix;
@@ -1659,6 +2220,11 @@ bool handleWeatherPayload(const String &payload) {
   return true;
 }
 
+bool handleWeatherPayload(const String &payload) {
+  JsonDocument doc;
+  return !deserializeJson(doc, payload) && applyWeatherJson(doc);
+}
+
 void pollWeather() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
   WiFiClient client;
@@ -1667,7 +2233,10 @@ void pollWeather() {
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
   if (!http.begin(client, url)) return;
   const int code = http.GET();
-  if (code == HTTP_CODE_OK) handleWeatherPayload(http.getString());
+  if (code == HTTP_CODE_OK) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, *http.getStreamPtr())) applyWeatherJson(doc);
+  }
   http.end();
 }
 
@@ -1855,7 +2424,9 @@ uint32_t marketReadU32BE(const uint8_t *data) {
 // A short/corrupt/oversized download therefore leaves the prior page intact.
 bool validateMarketFrame(const uint8_t *frame, size_t frameBytes,
                          uint64_t expectedVersion, uint64_t &versionOut) {
-  if (frameBytes < MARKET_PACKED_HEADER_BYTES || memcmp(frame, "MKT1", 4) != 0) return false;
+  if (frameBytes < MARKET_PACKED_HEADER_BYTES) return false;
+  const bool palette4 = memcmp(frame, "MKT2", 4) == 0;
+  if (!palette4 && memcmp(frame, "MKT1", 4) != 0) return false;
   const uint16_t width = ((uint16_t)frame[12] << 8) | frame[13];
   const uint16_t height = ((uint16_t)frame[14] << 8) | frame[15];
   if (width != SCREEN_W || height != SCREEN_H) return false;
@@ -1869,8 +2440,11 @@ bool validateMarketFrame(const uint8_t *frame, size_t frameBytes,
   while (cursor < payloadBytes) {
     const uint8_t control = payload[cursor++];
     const size_t count = (control & 0x7F) + 1;
-    const size_t encoded = (control & 0x80) ? 2 : count * 2;
+    const bool repeated = control & 0x80;
+    const size_t encoded = palette4 ? (repeated ? 1 : (count + 1) / 2)
+                                    : (repeated ? 2 : count * 2);
     if (cursor + encoded > payloadBytes || pixels + count > SCREEN_W * SCREEN_H) return false;
+    if (palette4 && repeated && payload[cursor] >= 16) return false;
     cursor += encoded;
     pixels += count;
   }
@@ -1885,16 +2459,31 @@ void drawMarketFrame(const uint8_t *frame, size_t frameBytes) {
   uint8_t *rowBytes = reinterpret_cast<uint8_t *>(rowBuf);
   size_t cursor = 0, rowPixels = 0;
   int y = 0;
+  const bool palette4 = memcmp(frame, "MKT2", 4) == 0;
   tft.startWrite();
   while (cursor < payloadBytes) {
     const uint8_t control = payload[cursor++];
     size_t count = (control & 0x7F) + 1;
     const bool repeated = control & 0x80;
-    uint8_t high = 0, low = 0;
-    if (repeated) { high = payload[cursor++]; low = payload[cursor++]; }
+    uint8_t high = 0, low = 0, paletteIndex = 0, packedIndexes = 0;
+    if (repeated) {
+      if (palette4) paletteIndex = payload[cursor++];
+      else { high = payload[cursor++]; low = payload[cursor++]; }
+    }
+    size_t item = 0;
     while (count-- > 0) {
-      rowBytes[rowPixels * 2] = repeated ? high : payload[cursor++];
-      rowBytes[rowPixels * 2 + 1] = repeated ? low : payload[cursor++];
+      if (palette4) {
+        if (!repeated && (item & 1U) == 0) packedIndexes = payload[cursor++];
+        const uint8_t index = repeated ? paletteIndex
+                                       : ((item & 1U) ? packedIndexes & 0x0F : packedIndexes >> 4);
+        const uint16_t color = pgm_read_word(&MARKET_PALETTE_RGB565[index]);
+        rowBytes[rowPixels * 2] = (uint8_t)(color >> 8);
+        rowBytes[rowPixels * 2 + 1] = (uint8_t)color;
+      } else {
+        rowBytes[rowPixels * 2] = repeated ? high : payload[cursor++];
+        rowBytes[rowPixels * 2 + 1] = repeated ? low : payload[cursor++];
+      }
+      item++;
       if (++rowPixels == SCREEN_W) {
         tft.pushImage(0, y++, SCREEN_W, 1, rowBuf);
         rowPixels = 0;
@@ -1905,7 +2494,8 @@ void drawMarketFrame(const uint8_t *frame, size_t frameBytes) {
   tft.endWrite();
 }
 
-bool fetchMarketFrame(uint64_t expectedVersion, size_t advertisedBytes) {
+bool fetchMarketFrame(uint64_t expectedVersion, size_t advertisedBytes, bool palette4) {
+  saveRuntimeStage(STAGE_MARKET_FRAME);
   if (advertisedBytes < MARKET_PACKED_HEADER_BYTES ||
       advertisedBytes > MARKET_PACKED_MAX_BYTES) return false;
   // Leave enough contiguous heap for HTTP/TCP and the rest of the firmware.
@@ -1920,7 +2510,7 @@ bool fetchMarketFrame(uint64_t expectedVersion, size_t advertisedBytes) {
   WiFiClient client;
   client.setTimeout(MARKET_READ_TIMEOUT_MS);
   HTTPClient http;
-  String url = "http://" + bridgeHost + "/market/frame.rle";
+  String url = "http://" + bridgeHost + (palette4 ? "/market/frame.pal" : "/market/frame.rle");
   http.setTimeout(MARKET_HTTP_TIMEOUT_MS);
   bool ok = false;
   if (http.begin(client, url)) {
@@ -1957,7 +2547,7 @@ void pollMarket() {
   const int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); return; }
   JsonDocument doc;
-  const DeserializationError err = deserializeJson(doc, http.getString());
+  const DeserializationError err = deserializeJson(doc, *http.getStreamPtr());
   http.end();
   if (err) return;
   const char *session = doc["session"] | "";
@@ -1969,16 +2559,21 @@ void pollMarket() {
     marketAutoDwellMs = (unsigned long)favoriteCount * (unsigned long)refreshSeconds * 1000UL;
     marketAutoDwellKnown = true;
   }
-  if (session[0] != '\0' && lastMarketFrameSession != session) {
-    lastMarketFrameSession = session;
+  if (session[0] != '\0' && strcmp(lastMarketFrameSession, session) != 0) {
+    strlcpy(lastMarketFrameSession, session, sizeof(lastMarketFrameSession));
     lastMarketFrameVersion = 0;
   }
   const uint64_t version = doc["version"] | (uint64_t)0;
-  const char *codec = doc["codec"] | "";
-  const size_t packedBytes = doc["packed_bytes"] | (size_t)0;
-  if (version > lastMarketFrameVersion &&
-      strcmp(codec, "rgb565-packbits-v1") == 0) {
-    fetchMarketFrame(version, packedBytes);
+  const char *paletteCodec = doc["palette_codec"] | "";
+  const size_t paletteBytes = doc["palette_bytes"] | (size_t)0;
+  const char *legacyCodec = doc["codec"] | "";
+  const size_t legacyBytes = doc["packed_bytes"] | (size_t)0;
+  if (version > lastMarketFrameVersion) {
+    if (strcmp(paletteCodec, "rgb565-palette4-rle-v1") == 0 && paletteBytes > 0) {
+      fetchMarketFrame(version, paletteBytes, true);
+    } else if (strcmp(legacyCodec, "rgb565-packbits-v1") == 0) {
+      fetchMarketFrame(version, legacyBytes, false);
+    }
   }
 }
 
@@ -2008,6 +2603,67 @@ void configModeCallback(WiFiManager *wm) {
 // keeps running from loop() while the USB serial link can take over the
 // screen (wired mode for APs with client isolation).
 void setupWiFi() {
+  wifiDisconnectedEventHandler = WiFi.onStationModeDisconnected(
+      [](const WiFiEventStationModeDisconnected &event) {
+        const unsigned long now = millis();
+        const bool recoveryGenerated = pendingDisconnectRecoveryStep != RECOVERY_NONE &&
+            now - pendingDisconnectRecoveryAtMs <= 5000UL;
+        wifiDisconnectCount++;
+        lastWifiDisconnectReason = (uint8_t)event.reason;
+        lastDisconnectWasRecovery = recoveryGenerated;
+        if (wifiEverGotIp && !wifiOutageActive) {
+          wifiOutageActive = true;
+          firstWifiDisconnectReason = lastWifiDisconnectReason;
+          firstWifiDisconnectRssi = lastConnectedWifiRssi;
+          firstWifiDisconnectChannel = lastConnectedWifiChannel;
+          memcpy(firstWifiDisconnectBssid, lastConnectedWifiBssid,
+                 sizeof(firstWifiDisconnectBssid));
+          firstDisconnectWasRecovery = recoveryGenerated;
+          if (!recoveryGenerated) {
+            wifiRecoveryMask = 0;
+            quickRecoveryAtMs = wifiReinitAtMs = radioResetAtMs = protectiveRestartAtMs = 0;
+          }
+          lastWifiOutageDurationMs = 0;
+        }
+        if (wifiDisconnectedSinceMs == 0) wifiDisconnectedSinceMs = max(now, 1UL);
+        syncWifiEvidenceToRtc();
+        rtcRuntimeDiag.wifiDisconnectCount = wifiDisconnectCount;
+        rtcRuntimeDiag.wifiStatus = WL_DISCONNECTED;
+        writeRtcRuntimeDiag();
+        Serial.printf("[wifi] disconnected reason=%u source=%s count=%lu\n",
+                      (unsigned)lastWifiDisconnectReason,
+                      recoveryGenerated ? "recovery" : "external/stack",
+                      (unsigned long)wifiDisconnectCount);
+      });
+  wifiGotIpEventHandler = WiFi.onStationModeGotIP(
+      [](const WiFiEventStationModeGotIP &event) {
+        if (wifiEverGotIp) wifiReconnectCount++;
+        wifiEverGotIp = true;
+        if (wifiOutageActive && wifiDisconnectedSinceMs != 0) {
+          lastWifiOutageDurationMs = millis() - wifiDisconnectedSinceMs;
+        }
+        wifiOutageActive = false;
+        pendingDisconnectRecoveryStep = RECOVERY_NONE;
+        pendingDisconnectRecoveryAtMs = 0;
+        wifiDisconnectedSinceMs = 0;
+        wifiSoftRecoveryDone = false;
+        wifiHardRecoveryDone = false;
+        wifiRadioRecoveryDone = false;
+        rtcRuntimeDiag.recoveryStep = RECOVERY_NONE;
+        syncWifiEvidenceToRtc();
+        rtcRuntimeDiag.wifiReconnectCount = wifiReconnectCount;
+        rtcRuntimeDiag.wifiStatus = WL_CONNECTED;
+        writeRtcRuntimeDiag();
+        lastPollMs = 0;
+        webServerNeedsRestart = webServerStarted;
+        Serial.printf("[wifi] got ip=%s reconnects=%lu\n", event.ip.toString().c_str(),
+                      (unsigned long)wifiReconnectCount);
+      });
+  WiFi.setAutoReconnect(true);
+  // This clock is continuously powered. Disabling modem sleep avoids a class
+  // of long-idle association/ARP failures seen with some routers and costs
+  // only additional power, not display functionality.
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   wifiManager.setAPCallback(configModeCallback);
   wifiManager.setConfigPortalBlocking(false);
 
@@ -2018,20 +2674,19 @@ void setupWiFi() {
 
   Serial.println("[wifi] starting WiFiManager autoConnect (non-blocking portal)...");
   bool ok = wifiManager.autoConnect(WIFI_PORTAL_AP_NAME);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   Serial.printf("[wifi] autoConnect result=%d ssid=%s ip=%s\n", ok, WiFi.SSID().c_str(),
                 WiFi.localIP().toString().c_str());
   Serial.printf("[wifi] bridge host = '%s'\n", bridgeHost.c_str());
 }
 
-bool parseStatusJson(const String &payload) {
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) return false;
-  bridgeVersion = doc["bridge_version"] | "--";
+bool applyStatusJson(JsonDocument &doc) {
+  strlcpy(bridgeVersion, doc["bridge_version"] | "--", sizeof(bridgeVersion));
 
   JsonObject c = doc["claude"];
   if (!c.isNull()) {
-    claudeStatus.status = c["status"] | "unknown";
+    strlcpy(claudeStatus.status, c["status"] | "unknown", sizeof(claudeStatus.status));
     claudeStatus.tokensToday = c["tokens_today"] | 0;
     claudeStatus.sessionMin = c["session_min"] | 0;
     claudeStatus.sessionWindowMin = c["session_window_min"] | 300;
@@ -2044,7 +2699,7 @@ bool parseStatusJson(const String &payload) {
 
   JsonObject x = doc["codex"];
   if (!x.isNull()) {
-    codexStatus.status = x["status"] | "unknown";
+    strlcpy(codexStatus.status, x["status"] | "unknown", sizeof(codexStatus.status));
     codexStatus.tokensToday = x["tokens_today"] | 0;
     codexStatus.primaryPct = x["primary_pct"] | -1.0;
     codexStatus.primaryResetMin = x["primary_reset_min"] | -1;
@@ -2056,6 +2711,11 @@ bool parseStatusJson(const String &payload) {
   }
   statusMusicPlaying = doc["music_playing"] | false;
   return true;
+}
+
+bool parseStatusJson(const String &payload) {
+  JsonDocument doc;
+  return !deserializeJson(doc, payload) && applyStatusJson(doc);
 }
 
 // The mode actually rendered. AUTO selects exactly one configured carousel
@@ -2090,6 +2750,7 @@ void pollBridge() {
     return;
   }
 
+  saveRuntimeStage(STAGE_BRIDGE);
   WiFiClient client;
   HTTPClient http;
   String url = "http://" + bridgeHost + BRIDGE_DEFAULT_PATH;
@@ -2097,26 +2758,33 @@ void pollBridge() {
 
   if (!http.begin(client, url)) {
     Serial.println("[bridge] http.begin() failed");
+    recordBridgeFailure(-1001);
+    saveRuntimeStage(STAGE_IDLE);
     return;
   }
   int code = http.GET();
+  lastBridgeHttpCode = code;
   Serial.printf("[bridge] GET %s -> %d\n", url.c_str(), code);
   if (code == HTTP_CODE_OK) {
-    String payload = http.getString();
-    if (parseStatusJson(payload)) {
+    JsonDocument doc;
+    if (!deserializeJson(doc, *http.getStreamPtr()) && applyStatusJson(doc)) {
       lastSuccessMs = millis();
       everPolled = true;
+      recordBridgeSuccess();
       Serial.printf("[bridge] claude=%s tok=%ld | codex=%s tok=%ld primary=%.0f%%\n",
-                    claudeStatus.status.c_str(), claudeStatus.tokensToday,
-                    codexStatus.status.c_str(), codexStatus.tokensToday, codexStatus.primaryPct);
+                    claudeStatus.status, claudeStatus.tokensToday,
+                    codexStatus.status, codexStatus.tokensToday, codexStatus.primaryPct);
     } else {
       Serial.println("[bridge] JSON parse failed");
+      recordBridgeFailure(-1002);
     }
   } else {
-    claudeStatus.status = "offline";
-    codexStatus.status = "offline";
+    recordBridgeFailure(code);
+    strlcpy(claudeStatus.status, "offline", sizeof(claudeStatus.status));
+    strlcpy(codexStatus.status, "offline", sizeof(codexStatus.status));
   }
   http.end();
+  saveRuntimeStage(STAGE_IDLE);
   DisplayMode eff = effectiveMode();
   if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK &&
       eff != MODE_MARKET && eff != MODE_WEATHER) {
@@ -2241,95 +2909,246 @@ String htmlEscape(const String &s) {
 }
 
 void handleRoot() {
-  String age = everPolled ? String((millis() - lastSuccessMs) / 1000) + " 秒前" : "从未";
-  String html;
-  html.reserve(3072);
-  html += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<title>AI Clock 设置</title>";
-  html += "<style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:24px "
-          "auto;padding:0 16px;color:#222} h1{font-size:20px} label{display:block;margin-top:16px;font-weight:600}"
-          "input{width:100%;box-sizing:border-box;padding:8px;font-size:16px;margin-top:4px}"
-          "button{margin-top:16px;padding:10px 20px;font-size:16px;background:#2563eb;color:#fff;"
-          "border:none;border-radius:6px}"
-          "table{margin-top:20px;border-collapse:collapse;width:100%}"
-          "td{padding:4px 8px;border-bottom:1px solid #eee;font-size:14px}"
-          ".dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}"
-          "</style></head><body>";
-  html += "<h1>AI Clock 设置</h1>";
-
-  html += "<form method='POST' action='/save'>";
-  html += "<label>Bridge host (ip:port)</label>";
-  html += "<input name='bridge' value='" + htmlEscape(bridgeHost) + "' placeholder='192.168.1.181:8765'>";
-  html += "<button type='submit'>保存</button>";
-  html += "</form>";
-
-  // Backlight brightness slider: applies live on release (PWM, persisted).
-  html += "<h2 style='font-size:16px;margin-top:28px'>屏幕亮度</h2>";
-  html += "<input type='range' min='0' max='100' value='" + String(brightness) + "' id='bri' "
-          "oninput=\"document.getElementById('briv').textContent=this.value+'%'\" "
-          "onchange=\"fetch('/api/brightness',{method:'POST',headers:{'Content-Type':"
-          "'application/x-www-form-urlencoded'},body:'level='+this.value})\">";
-  html += "<div style='font-size:13px;color:#555'>当前：<span id='briv'>" + String(brightness) +
-          "%</span>（0 = 熄屏，设置立即生效并记住）</div>";
-
-  // On-device GIF upload: replaces a character's animation without reflashing.
-  html += "<h2 style='font-size:16px;margin-top:28px'>桌宠动画（上传 GIF）</h2>";
-  html += "<p style='font-size:13px;color:#555'>上传一个 .gif，设备会在板上解码并缩放到对应角色的尺寸，"
-          "立刻替换动画，无需重新编译或烧录。GIF 太大可能因内存不足解码失败，换小一点的即可。</p>";
-  html += "<form id='gifForm' method='POST' enctype='multipart/form-data' onsubmit='return setGifAction()'>";
-  html += "<label>角色</label>";
-  html += "<select id='gifTarget'><option value='claude'>Claude</option><option value='codex'>Codex</option></select>";
-  html += "<label>GIF 文件</label><input type='file' name='file' accept='.gif' required>";
-  html += "<button type='submit'>上传并应用</button>";
-  html += "</form>";
-  html += "<script>function setGifAction(){"
-          "document.getElementById('gifForm').action='/sprite/'+document.getElementById('gifTarget').value;"
-          "return true;}</script>";
-
-  html += "<h2 style='font-size:16px;margin-top:28px'>设备诊断</h2><table>";
-  html += "<tr><td>Wi-Fi 名称</td><td>" + htmlEscape(WiFi.SSID()) + "</td></tr>";
-  html += "<tr><td>Wi-Fi 信号</td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
-  html += "<tr><td>设备 IP</td><td>" + WiFi.localIP().toString() + "</td></tr>";
-  html += "<tr><td>桥接状态</td><td>" + String(wiredActive() ? "在线（USB）" :
-      (everPolled && millis() - lastSuccessMs < 30000UL ? "在线（局域网）" : "离线")) + "</td></tr>";
-  html += "<tr><td>上次数据更新</td><td>" + age + "</td></tr>";
-  html += "<tr><td>固件版本</td><td>" FW_VERSION "</td></tr>";
-  html += "<tr><td>桥接版本</td><td>" + htmlEscape(bridgeVersion) + "</td></tr>";
-  html += "<tr><td>可用内存</td><td>" + String(ESP.getFreeHeap() / 1024UL) + " KB</td></tr>";
+  saveRuntimeStage(STAGE_WEB);
+  // Chunk the page directly from flash instead of building one multi-KB
+  // String on the ESP8266 heap.
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "text/html; charset=utf-8", "");
+  webServer.sendContent_P(PSTR(
+      "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>AI Clock 设置</title><style>"
+      "body{font-family:-apple-system,sans-serif;max-width:480px;margin:24px auto;padding:0 16px;color:#222}"
+      "h1{font-size:20px}label{display:block;margin-top:16px;font-weight:600}"
+      "input{width:100%;box-sizing:border-box;padding:8px;font-size:16px;margin-top:4px}"
+      "button{margin-top:16px;padding:10px 20px;font-size:16px;background:#2563eb;color:#fff;border:0;border-radius:6px}"
+      "table{margin-top:20px;border-collapse:collapse;width:100%}"
+      "td{padding:4px 8px;border-bottom:1px solid #eee;font-size:14px}"
+      "</style></head><body><h1>AI Clock 设置</h1>"
+      "<form method='POST' action='/save'><label>Bridge host (ip:port)</label>"
+      "<input name='bridge' value='"));
+  webServer.sendContent(htmlEscape(bridgeHost));
+  webServer.sendContent_P(PSTR("' placeholder='192.168.1.181:8765'><button type='submit'>保存</button></form>"
+      "<h2 style='font-size:16px;margin-top:28px'>屏幕亮度</h2>"
+      "<input type='range' min='0' max='100' value='"));
+  webServer.sendContent(String(brightness));
+  webServer.sendContent_P(PSTR("' id='bri' oninput=\"document.getElementById('briv').textContent=this.value+'%'\" "
+      "onchange=\"fetch('/api/brightness',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'level='+this.value})\">"
+      "<div style='font-size:13px;color:#555'>当前：<span id='briv'>"));
+  webServer.sendContent(String(brightness));
+  webServer.sendContent_P(PSTR("%</span>（0 = 熄屏，设置立即生效并记住）</div>"
+      "<h2 style='font-size:16px;margin-top:28px'>桌宠动画（上传 GIF）</h2>"
+      "<p style='font-size:13px;color:#555'>上传一个 .gif，设备会在板上解码并缩放到对应角色的尺寸，"
+      "立刻替换动画，无需重新编译或烧录。GIF 太大可能因内存不足解码失败，换小一点的即可。</p>"
+      "<form id='gifForm' method='POST' enctype='multipart/form-data' onsubmit='return setGifAction()'>"
+      "<label>角色</label><select id='gifTarget'><option value='claude'>Claude</option>"
+      "<option value='codex'>Codex</option></select><label>GIF 文件</label>"
+      "<input type='file' name='file' accept='.gif' required><button type='submit'>上传并应用</button></form>"
+      "<script>function setGifAction(){document.getElementById('gifForm').action='/sprite/'+"
+      "document.getElementById('gifTarget').value;return true}</script>"
+      "<h2 style='font-size:16px;margin-top:28px'>设备诊断</h2><table>"
+      "<tr><td>Wi-Fi 名称</td><td>"));
+  webServer.sendContent(htmlEscape(WiFi.SSID()));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>Wi-Fi 信号</td><td>"));
+  webServer.sendContent(String(WiFi.RSSI()) + " dBm");
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>设备 IP</td><td>"));
+  webServer.sendContent(WiFi.localIP().toString());
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>桥接状态</td><td>"));
+  webServer.sendContent(wiredActive() ? "在线（USB）" :
+      (everPolled && millis() - lastSuccessMs < 30000UL ? "在线（局域网）" : "离线"));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>上次数据更新</td><td>"));
+  webServer.sendContent(everPolled ? String((millis() - lastSuccessMs) / 1000) + " 秒前" : "从未");
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>固件版本</td><td>" FW_VERSION
+      "</td></tr><tr><td>桥接版本</td><td>"));
+  webServer.sendContent(htmlEscape(bridgeVersion));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>本次启动原因</td><td>"));
+  webServer.sendContent(htmlEscape(lastResetReason));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>累计启动次数</td><td>"));
+  webServer.sendContent(String(bootCount));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前运行位置</td><td>"));
+  webServer.sendContent(String(runtimeStageName(previousRuntimeStage)) + " / " +
+                        runtimeModeName(previousRuntimeMode));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前恢复步骤</td><td>"));
+  webServer.sendContent(recoveryStepName(previousRecoveryStep));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前首次断线</td><td>"));
+  webServer.sendContent(disconnectEventText(previousFirstWifiDisconnectReason,
+                                            previousFirstDisconnectWasRecovery));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前最后断线</td><td>"));
+  webServer.sendContent(disconnectEventText(previousLastWifiDisconnectReason,
+                                            previousLastDisconnectWasRecovery));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>首次断线前无线环境</td><td>"));
+  webServer.sendContent(previousFirstWifiDisconnectReason == 0 ? "无记录" :
+                        String(previousFirstWifiRssi) + " dBm / 信道 " +
+                        String(previousFirstWifiChannel) + " / " +
+                        wifiBssidText(previousFirstWifiBssid));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前断线时长</td><td>"));
+  webServer.sendContent(String(previousOutageDurationMs / 1000UL) + " 秒");
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前恢复时间线</td><td>"));
+  webServer.sendContent(recoveryTimelineText(previousQuickRecoveryAtMs,
+                        previousWifiReinitAtMs, previousRadioResetAtMs,
+                        previousProtectiveRestartAtMs));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前断线 / 重连</td><td>"));
+  webServer.sendContent(String(previousWifiDisconnectCount) + " / " +
+                        String(previousWifiReconnectCount));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前桥接失败 / HTTP</td><td>"));
+  webServer.sendContent(String(previousBridgeFailures) + " / " +
+                        String(previousBridgeHttpCode));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>Wi-Fi 内部状态</td><td>"));
+  webServer.sendContent(String(wifiStatusName((uint8_t)WiFi.status())) + " (" +
+                        String((int)WiFi.status()) + ")");
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>本次首次 / 最后断线</td><td>"));
+  webServer.sendContent(disconnectEventText(firstWifiDisconnectReason,
+                        firstDisconnectWasRecovery) + " / " +
+                        disconnectEventText(lastWifiDisconnectReason,
+                        lastDisconnectWasRecovery));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>首次断线前无线环境</td><td>"));
+  webServer.sendContent(firstWifiDisconnectReason == 0 ? "无记录" :
+                        String(firstWifiDisconnectRssi) + " dBm / 信道 " +
+                        String(firstWifiDisconnectChannel) + " / " +
+                        wifiBssidText(firstWifiDisconnectBssid));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>最近断线时长</td><td>"));
+  webServer.sendContent(String(currentWifiOutageDurationMs() / 1000UL) + " 秒");
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>本次恢复时间线</td><td>"));
+  webServer.sendContent(recoveryTimelineText(quickRecoveryAtMs, wifiReinitAtMs,
+                        radioResetAtMs, protectiveRestartAtMs));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>断线 / 重连次数</td><td>"));
+  webServer.sendContent(String(wifiDisconnectCount) + " / " + String(wifiReconnectCount));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>桥接连续 / 累计失败</td><td>"));
+  webServer.sendContent(String(bridgeConsecutiveFailures) + " / " + String(bridgeTotalFailures));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>最近桥接 HTTP 结果</td><td>"));
+  webServer.sendContent(String(lastBridgeHttpCode));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>最近恢复动作</td><td>"));
+  webServer.sendContent(htmlEscape(lastRecoveryAction));
+  for (uint8_t i = 0; i < restartHistory.count; ++i) {
+    const RestartHistoryEntry &entry = restartHistory.entries[i];
+    webServer.sendContent_P(PSTR("</td></tr><tr><td>历史重启 #"));
+    webServer.sendContent(String(entry.bootCount));
+    webServer.sendContent_P(PSTR("</td><td>"));
+    webServer.sendContent(String(entry.resetReason) + " · " + runtimeStageName(entry.stage) +
+                          "/" + runtimeModeName(entry.mode) + " · 首次原因 " +
+                          String((unsigned)entry.firstReason) + "（" +
+                          disconnectOriginName(entry.firstWasRecovery != 0) + "）· " +
+                          String(entry.outageDurationMs / 1000UL) + "秒");
+  }
+  webServer.sendContent_P(PSTR(
+      "</td></tr><tr><td>空闲可用内存</td><td id='heap'>--</td></tr>"
+      "<tr><td>最低空闲内存</td><td id='heapMin'>--</td></tr>"
+      "<tr><td>最大连续内存块</td><td id='heapBlock'>--</td></tr>"
+      "<tr><td>内存碎片率</td><td id='heapFrag'>--</td></tr>"));
   FSInfo webFsInfo;
   if (LittleFS.info(webFsInfo)) {
-    html += "<tr><td>文件存储</td><td>" + String(webFsInfo.usedBytes / 1024UL) + " / " +
-            String(webFsInfo.totalBytes / 1024UL) + " KB</td></tr>";
+    webServer.sendContent_P(PSTR("<tr><td>文件存储</td><td>"));
+    webServer.sendContent(String(webFsInfo.usedBytes / 1024UL) + " / " +
+                          String(webFsInfo.totalBytes / 1024UL) + " KB");
+    webServer.sendContent_P(PSTR("</td></tr>"));
   }
   const unsigned long upMinutes = millis() / 60000UL;
-  html += "<tr><td>运行时间</td><td>" + String(upMinutes / 1440UL) + " 天 " +
-          String((upMinutes / 60UL) % 24UL) + " 小时 " + String(upMinutes % 60UL) + " 分</td></tr>";
-  html += "<tr><td>OTA 可用空间</td><td>" + String(ESP.getFreeSketchSpace() / 1024UL) + " KB</td></tr>";
-  html += "<tr><td>Claude</td><td>" + htmlEscape(claudeStatus.status) + ", " +
-          formatTokens(claudeStatus.tokensToday) + " tok</td></tr>";
-  html += "<tr><td>Codex</td><td>" + htmlEscape(codexStatus.status) + ", " +
-          formatTokens(codexStatus.tokensToday) + " tok, " +
-          (codexStatus.primaryPct >= 0 ? "5h " + String(codexStatus.primaryPct, 0) + "%"
-           : codexStatus.weeklyPct >= 0 ? "Wk " + String(codexStatus.weeklyPct, 0) + "%"
-                                        : "5h ?") + "</td></tr>";
-  html += "</table>";
+  webServer.sendContent_P(PSTR("<tr><td>运行时间</td><td>"));
+  webServer.sendContent(String(upMinutes / 1440UL) + " 天 " +
+      String((upMinutes / 60UL) % 24UL) + " 小时 " + String(upMinutes % 60UL) + " 分");
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>OTA 可用空间</td><td>"));
+  webServer.sendContent(String(ESP.getFreeSketchSpace() / 1024UL) + " KB");
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>Claude</td><td>"));
+  webServer.sendContent(htmlEscape(claudeStatus.status) + ", " +
+                        formatTokens(claudeStatus.tokensToday) + " tok");
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>Codex</td><td>"));
+  webServer.sendContent(htmlEscape(codexStatus.status) + ", " +
+      formatTokens(codexStatus.tokensToday) + " tok, " +
+      (codexStatus.primaryPct >= 0 ? "5h " + String(codexStatus.primaryPct, 0) + "%" :
+       codexStatus.weeklyPct >= 0 ? "Wk " + String(codexStatus.weeklyPct, 0) + "%" : "5h ?"));
+  webServer.sendContent_P(PSTR(
+      "</td></tr></table>"
+      "<form method='POST' action='/reconnect' onsubmit=\"return confirm('立即重新初始化 Wi-Fi？设备设置不会丢失。')\">"
+      "<button type='submit' style='background:#d97706'>立即重连 Wi-Fi</button></form>"
+      "<form method='POST' action='/reset-wifi' onsubmit=\"return confirm('清除 WiFi 设置并重启？设备会开启配网热点。')\">"
+      "<button type='submit' style='background:#dc2626'>重置 WiFi</button></form>"
+      "<h2 style='font-size:16px;margin-top:32px'>网络 OTA 固件升级</h2>"
+      "<p style='font-size:13px;color:#555'>当前版本：<b>" FW_VERSION "</b>。请选择本项目生成的 ESP8266 firmware.bin。"
+      "升级不会清除 Wi-Fi、轮播设置或桌宠文件。上传期间请勿断电。</p>"
+      "<form method='POST' action='/update' enctype='multipart/form-data' "
+      "onsubmit=\"return confirm('确认升级固件？上传和重启期间请勿断电。')\">"
+      "<input type='file' name='firmware' accept='.bin,application/octet-stream' required>"
+      "<button type='submit' style='background:#059669'>上传并升级</button></form>"
+      "<script>function put(id,v){document.getElementById(id).textContent=v}"
+      "function loadDiag(){fetch('/api/diagnostics',{cache:'no-store'}).then(r=>r.json()).then(d=>{"
+      "put('heap',Math.round(d.free_heap/1024)+' KB');put('heapMin',Math.round(d.min_free_heap/1024)+' KB');"
+      "put('heapBlock',Math.round(d.max_free_block/1024)+' KB');put('heapFrag',d.fragmentation+'%');"
+      "}).catch(()=>{})}loadDiag();setInterval(loadDiag,5000)</script></body></html>"));
+  webServer.sendContent(""); // terminating chunk for the HTTP/1.1 response
+  saveRuntimeStage(STAGE_IDLE);
+}
 
-  html += "<form method='POST' action='/reset-wifi' onsubmit=\"return confirm('清除 WiFi "
-          "设置并重启？设备会开启配网热点。');\">";
-  html += "<button type='submit' style='background:#dc2626'>重置 WiFi</button>";
-  html += "</form>";
+void handleApiDiagnostics() {
+  JsonDocument doc;
+  doc["free_heap"] = idleFreeHeap;
+  doc["min_free_heap"] = minimumIdleFreeHeap;
+  doc["max_free_block"] = idleMaxFreeBlock;
+  doc["fragmentation"] = idleHeapFragmentation;
+  doc["reset_reason"] = lastResetReason;
+  doc["reset_info"] = lastResetInfo;
+  doc["boot_count"] = bootCount;
+  doc["previous_stage"] = runtimeStageName(previousRuntimeStage);
+  doc["previous_mode"] = runtimeModeName(previousRuntimeMode);
+  doc["previous_recovery_step"] = recoveryStepName(previousRecoveryStep);
+  doc["previous_first_disconnect_reason"] = previousFirstWifiDisconnectReason;
+  doc["previous_last_disconnect_reason"] = previousLastWifiDisconnectReason;
+  doc["previous_first_disconnect_origin"] = disconnectOriginName(previousFirstDisconnectWasRecovery);
+  doc["previous_last_disconnect_origin"] = disconnectOriginName(previousLastDisconnectWasRecovery);
+  doc["previous_first_disconnect_rssi"] = previousFirstWifiRssi;
+  doc["previous_first_disconnect_channel"] = previousFirstWifiChannel;
+  doc["previous_first_disconnect_bssid"] = wifiBssidText(previousFirstWifiBssid);
+  doc["previous_outage_ms"] = previousOutageDurationMs;
+  doc["previous_recovery_timeline"] = recoveryTimelineText(previousQuickRecoveryAtMs,
+      previousWifiReinitAtMs, previousRadioResetAtMs, previousProtectiveRestartAtMs);
+  doc["previous_wifi_disconnects"] = previousWifiDisconnectCount;
+  doc["previous_wifi_reconnects"] = previousWifiReconnectCount;
+  doc["previous_bridge_failures"] = previousBridgeFailures;
+  doc["previous_bridge_http_code"] = previousBridgeHttpCode;
+  doc["wifi_status"] = (int)WiFi.status();
+  doc["first_disconnect_reason"] = firstWifiDisconnectReason;
+  doc["last_disconnect_reason"] = lastWifiDisconnectReason;
+  doc["first_disconnect_origin"] = disconnectOriginName(firstDisconnectWasRecovery);
+  doc["last_disconnect_origin"] = disconnectOriginName(lastDisconnectWasRecovery);
+  doc["first_disconnect_rssi"] = firstWifiDisconnectRssi;
+  doc["first_disconnect_channel"] = firstWifiDisconnectChannel;
+  doc["first_disconnect_bssid"] = wifiBssidText(firstWifiDisconnectBssid);
+  doc["outage_ms"] = currentWifiOutageDurationMs();
+  doc["recovery_timeline"] = recoveryTimelineText(quickRecoveryAtMs, wifiReinitAtMs,
+                                                   radioResetAtMs, protectiveRestartAtMs);
+  doc["wifi_disconnects"] = wifiDisconnectCount;
+  doc["wifi_reconnects"] = wifiReconnectCount;
+  doc["bridge_consecutive_failures"] = bridgeConsecutiveFailures;
+  doc["bridge_total_failures"] = bridgeTotalFailures;
+  doc["last_bridge_http_code"] = lastBridgeHttpCode;
+  doc["last_recovery_action"] = lastRecoveryAction;
+  JsonArray history = doc["restart_history"].to<JsonArray>();
+  for (uint8_t i = 0; i < restartHistory.count; ++i) {
+    const RestartHistoryEntry &entry = restartHistory.entries[i];
+    JsonObject item = history.add<JsonObject>();
+    item["boot_count"] = entry.bootCount;
+    item["reset_reason"] = entry.resetReason;
+    item["stage"] = runtimeStageName(entry.stage);
+    item["mode"] = runtimeModeName(entry.mode);
+    item["recovery_step"] = recoveryStepName(entry.recoveryStep);
+    item["first_reason"] = entry.firstReason;
+    item["last_reason"] = entry.lastReason;
+    item["first_origin"] = disconnectOriginName(entry.firstWasRecovery != 0);
+    item["first_rssi"] = entry.firstRssi;
+    item["first_channel"] = entry.firstChannel;
+    item["outage_ms"] = entry.outageDurationMs;
+  }
+  String body;
+  serializeJson(doc, body);
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json", body);
+}
 
-  html += "<h2 style='font-size:16px;margin-top:32px'>网络 OTA 固件升级</h2>";
-  html += "<p style='font-size:13px;color:#555'>当前版本：<b>" FW_VERSION "</b>。请选择本项目生成的 "
-          "ESP8266 firmware.bin。升级不会清除 Wi-Fi、轮播设置或桌宠文件。上传期间请勿断电。</p>";
-  html += "<form method='POST' action='/update' enctype='multipart/form-data' "
-          "onsubmit=\"return confirm('确认升级固件？上传和重启期间请勿断电。')\">";
-  html += "<input type='file' name='firmware' accept='.bin,application/octet-stream' required>";
-  html += "<button type='submit' style='background:#059669'>上传并升级</button></form>";
-
-  html += "</body></html>";
-  webServer.send(200, "text/html", html);
+void handleManualReconnect() {
+  webServer.send(200, "text/html; charset=utf-8",
+                 "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+                 "<h2>正在重新连接 Wi-Fi</h2><p>设备会保留全部设置，请等待约 20 秒后返回诊断页。</p>"
+                 "<script>setTimeout(()=>location.href='/',20000)</script>");
+  manualReconnectAtMs = millis() + 500UL;
 }
 
 void handleSave() {
@@ -2371,7 +3190,30 @@ void handleApiInfo() {
   doc["fw"] = FW_VERSION;
   doc["bridge_version"] = bridgeVersion;
   doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -127;
-  doc["free_heap"] = ESP.getFreeHeap();
+  doc["free_heap"] = idleFreeHeap;
+  doc["min_free_heap"] = minimumIdleFreeHeap;
+  doc["max_free_block"] = idleMaxFreeBlock;
+  doc["heap_fragmentation"] = idleHeapFragmentation;
+  doc["reset_reason"] = lastResetReason;
+  doc["boot_count"] = bootCount;
+  doc["previous_stage"] = runtimeStageName(previousRuntimeStage);
+  doc["previous_mode"] = runtimeModeName(previousRuntimeMode);
+  doc["wifi_status"] = (int)WiFi.status();
+  doc["first_wifi_disconnect_reason"] = firstWifiDisconnectReason;
+  doc["last_wifi_disconnect_reason"] = lastWifiDisconnectReason;
+  doc["wifi_disconnect_reason"] = lastWifiDisconnectReason; // compatibility
+  doc["first_wifi_disconnect_origin"] = disconnectOriginName(firstDisconnectWasRecovery);
+  doc["last_wifi_disconnect_origin"] = disconnectOriginName(lastDisconnectWasRecovery);
+  doc["first_wifi_disconnect_rssi"] = firstWifiDisconnectRssi;
+  doc["first_wifi_disconnect_channel"] = firstWifiDisconnectChannel;
+  doc["first_wifi_disconnect_bssid"] = wifiBssidText(firstWifiDisconnectBssid);
+  doc["wifi_outage_ms"] = currentWifiOutageDurationMs();
+  doc["wifi_disconnects"] = wifiDisconnectCount;
+  doc["wifi_reconnects"] = wifiReconnectCount;
+  doc["bridge_consecutive_failures"] = bridgeConsecutiveFailures;
+  doc["bridge_total_failures"] = bridgeTotalFailures;
+  doc["last_bridge_http_code"] = lastBridgeHttpCode;
+  doc["last_recovery_action"] = lastRecoveryAction;
   doc["uptime_s"] = millis() / 1000UL;
   doc["ota_space"] = ESP.getFreeSketchSpace();
   FSInfo fsInfo;
@@ -2625,6 +3467,7 @@ unsigned long otaRestartAtMs = 0;
 void handleOtaUploadChunk() {
   HTTPUpload &upload = webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
+    saveRuntimeStage(STAGE_OTA);
     otaUploadOK = false;
     otaUploadStarted = true;
     otaUploadError = "";
@@ -2720,6 +3563,7 @@ void handleSpriteReset(ActiveApp slot) {
 }
 
 void handleResetWifi() {
+  saveRuntimeStage(STAGE_WIFI_RECOVERY);
   webServer.send(200, "text/html", "<html><body>Resetting WiFi, device will restart...</body></html>");
   delay(200);
   WiFiManager wm;
@@ -2956,8 +3800,10 @@ void handleSpriteUploadDone(ActiveApp slot) {
 void setupWebServer() {
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/save", HTTP_POST, handleSave);
+  webServer.on("/reconnect", HTTP_POST, handleManualReconnect);
   webServer.on("/reset-wifi", HTTP_POST, handleResetWifi);
   webServer.on("/api/info", HTTP_GET, handleApiInfo);
+  webServer.on("/api/diagnostics", HTTP_GET, handleApiDiagnostics);
   webServer.on("/api/display", HTTP_POST, handleApiDisplay);
   webServer.on("/api/auto", HTTP_POST, handleApiAutoCycle);
   webServer.on("/api/bridge", HTTP_POST, handleApiBridge);
@@ -2985,6 +3831,7 @@ void setup() {
   Serial.setRxBufferSize(2048); // a serial #STATUS frame (~600B) must survive a slow draw
   Serial.begin(115200);
   LittleFS.begin();
+  loadBootDiagnostics();
   loadBridgeHost();
   loadBrightness();
   loadAutoCycle();
@@ -3015,6 +3862,8 @@ void setup() {
     showMainUiIfNeeded();
     pollBridge();
   }
+  sampleHeapHealth(true);
+  saveRuntimeStage(STAGE_IDLE);
   // else: the config-portal screen stays up; either the user configures WiFi
   // (handled in loop) or serial #STATUS frames arrive and take the screen over
 }
@@ -3032,9 +3881,22 @@ void loop() {
     lastPollMs = 0; // poll the bridge right away
   }
   if (webServerStarted) webServer.handleClient();
-  if (otaRestartAtMs != 0 && (long)(millis() - otaRestartAtMs) >= 0) {
-    ESP.restart();
+  if (otaRestartAtMs != 0) {
+    if ((long)(millis() - otaRestartAtMs) >= 0) ESP.restart();
+    return; // preserve eboot's pending OTA command until the reboot
   }
+  if (manualReconnectAtMs != 0 && (long)(millis() - manualReconnectAtMs) >= 0) {
+    manualReconnectAtMs = 0;
+    hardReconnectWiFi("用户从诊断页手动重新连接", RECOVERY_MANUAL);
+  }
+  maintainConnectivity(millis());
+  if (webServerNeedsRestart && WiFi.status() == WL_CONNECTED) {
+    webServer.stop();
+    webServer.begin();
+    webServerNeedsRestart = false;
+    Serial.printf("[web] server rebound after Wi-Fi recovery on %s\n", WiFi.localIP().toString().c_str());
+  }
+  sampleHeapHealth();
   if (!mainUiShown) return; // config-portal screen is up, nothing to animate
 
   unsigned long nowMs = millis();
@@ -3044,6 +3906,7 @@ void loop() {
   // audio plays). On a transition, reset the incoming mode's chrome so it
   // repaints cleanly, and repaint the pet immediately when returning to it.
   DisplayMode eff = effectiveMode();
+  diagnosticEffectiveMode = (uint8_t)eff;
   if (eff != lastEffectiveMode) {
     lastEffectiveMode = eff;
     if (eff == MODE_NET) {
@@ -3080,25 +3943,35 @@ void loop() {
     }
     if (nowMs - lastNetPollMs >= NET_POLL_INTERVAL_MS) {
       lastNetPollMs = nowMs;
+      saveRuntimeStage(STAGE_NET);
       pollNet();
+      saveRuntimeStage(STAGE_IDLE);
     }
   } else if (eff == MODE_MUSIC) {
     // music now-playing mode: cover art + track metadata from the bridge
     if (nowMs - lastMusicPollMs >= MUSIC_POLL_INTERVAL_MS) {
       lastMusicPollMs = nowMs;
+      saveRuntimeStage(STAGE_MUSIC);
       pollMusic();
+      saveRuntimeStage(STAGE_IDLE);
     }
   } else if (eff == MODE_STOCK) {
     // stock watchlist: HTTP poll unless the serial link is pushing #STOCK
     if (nowMs - lastStockPollMs >= STOCK_POLL_INTERVAL_MS) {
       lastStockPollMs = nowMs;
-      if (!wiredActive()) pollStock();
+      if (!wiredActive()) {
+        saveRuntimeStage(STAGE_STOCK);
+        pollStock();
+        saveRuntimeStage(STAGE_IDLE);
+      }
     }
     if (!stockChromeDrawn || stockDirty) drawStockScreen();
   } else if (eff == MODE_MARKET) {
     if (nowMs - lastMarketPollMs >= MARKET_POLL_INTERVAL_MS) {
       lastMarketPollMs = nowMs;
+      saveRuntimeStage(STAGE_MARKET_META);
       pollMarket();
+      saveRuntimeStage(STAGE_IDLE);
     }
   } else if (eff == MODE_WEATHER) {
     if (!weatherChromeDrawn) drawWeatherScreen(true);
@@ -3110,8 +3983,8 @@ void loop() {
     // sprite walk-cycle animation (only advances while that app is showing)
     if (nowMs - lastAnimMs >= ANIM_INTERVAL_MS) {
       lastAnimMs = nowMs;
-      bool claudeWorking = claudeStatus.status == "working";
-      bool codexWorking = codexStatus.status == "working";
+      bool claudeWorking = strcmp(claudeStatus.status, "working") == 0;
+      bool codexWorking = strcmp(codexStatus.status, "working") == 0;
       if (showingCd != CD_NONE) {
         // countdown owns the center area: no sprite frames over it
       } else if (currentApp == APP_CLAUDE && claudeWorking) {
@@ -3162,6 +4035,8 @@ void loop() {
   if (!wiredActive() &&
       (lastWeatherPollMs == 0 || nowMs - lastWeatherPollMs >= WEATHER_POLL_INTERVAL_MS)) {
     lastWeatherPollMs = nowMs;
+    saveRuntimeStage(STAGE_WEATHER);
     pollWeather();
+    saveRuntimeStage(STAGE_IDLE);
   }
 }

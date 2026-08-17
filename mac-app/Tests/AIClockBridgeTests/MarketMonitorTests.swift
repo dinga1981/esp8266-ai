@@ -2,6 +2,29 @@ import XCTest
 @testable import AIClockBridge
 
 final class MarketMonitorTests: XCTestCase {
+    func testPaletteCodecPreservesRedAndGreen() {
+        var bytes = [UInt8](repeating: 0, count: MarketFrameCodec.width * MarketFrameCodec.height * 2)
+        bytes[0] = 0xF8; bytes[1] = 0x00 // red RGB565
+        bytes[2] = 0x07; bytes[3] = 0xE0 // green RGB565
+        let indexes = MarketFrameCodec.paletteIndexes(Data(bytes))
+
+        XCTAssertEqual(indexes[0], 6)
+        XCTAssertEqual(indexes[1], 7)
+        XCTAssertEqual(indexes[2], 0)
+    }
+
+    func testPaletteCodecMakesSmallValidatedEnvelope() {
+        let black = Data(repeating: 0, count: MarketFrameCodec.width * MarketFrameCodec.height * 2)
+        let packed = MarketFrameCodec.packPalette4(black)
+        let envelope = MarketFrameCodec.paletteEnvelope(packed: packed, version: 42)
+
+        XCTAssertLessThan(packed.count, 1_000)
+        XCTAssertEqual(String(decoding: envelope.prefix(4), as: UTF8.self), "MKT2")
+        XCTAssertEqual(envelope.count, MarketFrameCodec.headerBytes + packed.count)
+        XCTAssertEqual(MarketFrameCodec.crc32(envelope.dropFirst(MarketFrameCodec.headerBytes)),
+                       MarketFrameCodec.crc32(packed))
+    }
+
     func testLondonSpotGoldUsesOHLCForexFeed() throws {
         let instrument = try XCTUnwrap(MarketInstrument.parse("fxXAUUSD"))
 

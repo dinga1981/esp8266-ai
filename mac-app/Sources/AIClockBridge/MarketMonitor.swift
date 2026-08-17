@@ -28,6 +28,30 @@ enum MarketFrameCodec {
     static let height = 240
     static let headerBytes = 20
     private static let magic: [UInt8] = [0x4D, 0x4B, 0x54, 0x31] // MKT1
+    private static let paletteMagic: [UInt8] = [0x4D, 0x4B, 0x54, 0x32] // MKT2
+
+    // Fixed 16-color RGB565 palette shared with the ESP8266 decoder. It keeps
+    // red/green market semantics and the small set of UI accent colors while
+    // collapsing anti-aliased shades that made the old RGB565 PackBits frames
+    // too large for one contiguous ESP8266 heap allocation.
+    static let paletteRGB565: [UInt16] = [
+        0x0000, // black
+        0xFFFF, // white
+        0xC618, // light gray
+        0x7BEF, // medium gray
+        0x39E7, // dark gray
+        0x18C3, // grid gray
+        0xF800, // red
+        0x07E0, // green
+        0xFBE7, // light red
+        0x37E7, // light green
+        0xFFE0, // yellow
+        0xFD20, // orange
+        0x07FF, // cyan
+        0x001F, // blue
+        0xF81F, // magenta
+        0x8410, // neutral gray
+    ]
 
     static func packRGB565(_ frame: Data) -> Data {
         guard frame.count == width * height * 2 else { return Data() }
@@ -72,7 +96,84 @@ enum MarketFrameCodec {
         return packed
     }
 
+    static func paletteIndexes(_ frame: Data) -> [UInt8] {
+        guard frame.count == width * height * 2 else { return [] }
+        let bytes = [UInt8](frame)
+        var cache: [UInt16: UInt8] = [:]
+        var indexes = [UInt8]()
+        indexes.reserveCapacity(width * height)
+        for pixel in 0..<(width * height) {
+            let value = (UInt16(bytes[pixel * 2]) << 8) | UInt16(bytes[pixel * 2 + 1])
+            if let index = cache[value] {
+                indexes.append(index)
+                continue
+            }
+            let r = Int((value >> 11) & 0x1F)
+            let g = Int((value >> 5) & 0x3F)
+            let b = Int(value & 0x1F)
+            var best = 0
+            var bestDistance = Int.max
+            for (index, candidate) in paletteRGB565.enumerated() {
+                let dr = r - Int((candidate >> 11) & 0x1F)
+                let dg = g - Int((candidate >> 5) & 0x3F)
+                let db = b - Int(candidate & 0x1F)
+                let distance = dr * dr * 2 + dg * dg + db * db * 2
+                if distance < bestDistance { best = index; bestDistance = distance }
+            }
+            let index = UInt8(best)
+            cache[value] = index
+            indexes.append(index)
+        }
+        return indexes
+    }
+
+    /// Palette PackBits: bit 7 means one repeated palette index; otherwise
+    /// literal indexes are packed two per byte. Bits 0...6 store count - 1.
+    static func packPalette4(_ frame: Data) -> Data {
+        let indexes = paletteIndexes(frame)
+        guard indexes.count == width * height else { return Data() }
+        var packed = Data(capacity: frame.count / 12)
+        var pixel = 0
+        while pixel < indexes.count {
+            var repeated = 1
+            while repeated < 128, pixel + repeated < indexes.count,
+                  indexes[pixel] == indexes[pixel + repeated] { repeated += 1 }
+            if repeated >= 3 {
+                packed.append(0x80 | UInt8(repeated - 1))
+                packed.append(indexes[pixel])
+                pixel += repeated
+                continue
+            }
+
+            let start = pixel
+            pixel += 1
+            while pixel - start < 128, pixel < indexes.count {
+                var nextRepeated = 1
+                while nextRepeated < 128, pixel + nextRepeated < indexes.count,
+                      indexes[pixel] == indexes[pixel + nextRepeated] { nextRepeated += 1 }
+                if nextRepeated >= 3 { break }
+                pixel += 1
+            }
+            let count = pixel - start
+            packed.append(UInt8(count - 1))
+            for offset in stride(from: 0, to: count, by: 2) {
+                let high = indexes[start + offset] << 4
+                let low = offset + 1 < count ? indexes[start + offset + 1] : 0
+                packed.append(high | low)
+            }
+        }
+        return packed
+    }
+
     static func envelope(packed: Data, version: UInt64) -> Data {
+        envelope(packed: packed, version: version, magic: magic)
+    }
+
+    static func paletteEnvelope(packed: Data, version: UInt64) -> Data {
+        envelope(packed: packed, version: version, magic: paletteMagic)
+    }
+
+    private static func envelope(packed: Data, version: UInt64, magic: [UInt8]) -> Data {
         guard !packed.isEmpty else { return Data() }
         var out = Data(capacity: headerBytes + packed.count)
         out.append(contentsOf: magic)
@@ -385,6 +486,7 @@ final class MarketMonitor {
     private var cachedFrame = Data()
     private var cachedFrameKey = ""
     private var cachedPackedFrame = Data()
+    private var cachedPaletteFrame = Data()
     private var snapshotCache: [String: MarketSnapshot] = [:]
     private var frameCache: [String: Data] = [:]
     private var inFlightKeys = Set<String>()
@@ -488,11 +590,19 @@ final class MarketMonitor {
         return cachedPackedFrame
     }
 
+    /// ESP8266-friendly fixed-palette frame. The legacy RGB565 endpoint stays
+    /// available so older firmware and local preview tooling remain usable.
+    var paletteFrameEnvelope: Data {
+        lock.lock(); defer { lock.unlock() }
+        return cachedPaletteFrame
+    }
+
     var frameVersionJSON: Data {
         lock.lock()
         let version = frameVersion
         let s = value
         let packedBytes = cachedPackedFrame.count
+        let paletteBytes = cachedPaletteFrame.count
         let favoriteCount = favoriteItems.count
         let refreshSeconds = Int(refreshInterval.seconds)
         // Keep the session empty for the initial WAITING frame. On a bridge
@@ -506,6 +616,8 @@ final class MarketMonitor {
             "bytes": 240 * 240 * 2,
             "packed_bytes": packedBytes,
             "codec": "rgb565-packbits-v1",
+            "palette_bytes": paletteBytes,
+            "palette_codec": "rgb565-palette4-rle-v1",
             "instrument": s.instrument.id,
             "interval": s.interval.rawValue,
             "favorite_count": favoriteCount,
@@ -540,6 +652,8 @@ final class MarketMonitor {
         cachedFrameKey = Self.frameKey(value)
         cachedPackedFrame = MarketFrameCodec.envelope(
             packed: MarketFrameCodec.packRGB565(cachedFrame), version: frameVersion)
+        cachedPaletteFrame = MarketFrameCodec.paletteEnvelope(
+            packed: MarketFrameCodec.packPalette4(cachedFrame), version: frameVersion)
         let initialKey = cacheKey(value.instrument, interval: value.interval)
         snapshotCache[initialKey] = value
         frameCache[initialKey] = cachedFrame
@@ -718,6 +832,7 @@ final class MarketMonitor {
     /// or half-populated market page.
     private func activate(_ snapshot: MarketSnapshot, frame: Data) {
         let packed = MarketFrameCodec.packRGB565(frame)
+        let palettePacked = MarketFrameCodec.packPalette4(frame)
         lock.lock()
         guard requestedInstrument.id == snapshot.instrument.id,
               requestedInterval == snapshot.interval else {
@@ -731,6 +846,8 @@ final class MarketMonitor {
         if pixelsChanged {
             let version = nextFrameVersionLocked()
             cachedPackedFrame = MarketFrameCodec.envelope(packed: packed, version: version)
+            cachedPaletteFrame = MarketFrameCodec.paletteEnvelope(
+                packed: palettePacked, version: version)
         }
         lock.unlock()
     }
@@ -1482,13 +1599,18 @@ enum MarketFrameRenderer {
         let title = "\(s.instrument.name)  \(s.instrument.symbol)  \(s.interval.rawValue)"
         (title as NSString).draw(at: CGPoint(x: 8, y: 8), withAttributes: [.font: titleFont, .foregroundColor: NSColor(white: 0.72, alpha: 1)])
         let price = formatPrice(s.price, currency: s.instrument.currency)
+        let priceFontSize: CGFloat = price.count > 8 ? 18 : 23
         (price as NSString).draw(at: CGPoint(x: 8, y: 22), withAttributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 23, weight: .bold), .foregroundColor: NSColor.white,
+            .font: NSFont.monospacedDigitSystemFont(ofSize: priceFontSize, weight: .bold), .foregroundColor: NSColor.white,
         ])
         let up = s.change24h >= 0
         let move = String(format: "%@%.2f%%", up ? "+" : "", s.change24h)
-        (move as NSString).draw(at: CGPoint(x: 158, y: 31), withAttributes: [
-            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .semibold), .foregroundColor: movementColor(s.instrument.region, up: up),
+        let moveStyle = NSMutableParagraphStyle()
+        moveStyle.alignment = .right
+        (move as NSString).draw(in: CGRect(x: 126, y: 27, width: 106, height: 25), withAttributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 16, weight: .bold),
+            .foregroundColor: movementColor(s.instrument.region, up: up),
+            .paragraphStyle: moveStyle,
         ])
         let chart = CGRect(x: 9, y: 58, width: 222, height: 153)
         NSColor(white: 0.12, alpha: 1).setStroke()

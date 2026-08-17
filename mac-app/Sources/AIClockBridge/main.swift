@@ -33,7 +33,10 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--test-pet" {
     exit(0)
 }
 
-let port: UInt16 = 8765
+// The environment override is intentionally undocumented UI-wise; it lets
+// release verification run beside an installed bridge without disturbing the
+// user's live port 8765 service.
+let port = UInt16(ProcessInfo.processInfo.environment["AI_CLOCK_BRIDGE_PORT"] ?? "") ?? 8765
 let service = StatusService()
 let usage = UsageFetcher()
 service.usage = usage
@@ -73,6 +76,7 @@ let server = HTTPServer(port: port, routes: [
     "/music/text.raw": { nowPlaying.textRGB565 },
     "/stock/names.raw": { stockMonitor.namesRGB565() },
     "/market/frame.rle": { marketMonitor.packedFrameEnvelope },
+    "/market/frame.pal": { marketMonitor.paletteFrameEnvelope },
     "/market/frame.raw": { marketMonitor.frameEnvelope },
     "/weather/text.raw": { weatherMonitor.textRGB565() },
 ], postRoutes: [
