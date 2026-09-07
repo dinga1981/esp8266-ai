@@ -2,6 +2,7 @@ firmware/.pio/
 firmware/.pio-venv/
 .platformio-core/
 mac-app/.build/
+mac-app/.build-*/
 windows-app/**/bin/
 windows-app/**/obj/
 __pycache__/

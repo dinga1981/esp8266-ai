@@ -1,6 +1,6 @@
 import Foundation
 
-let aiClockBridgeVersion = "0.5.12"
+let aiClockBridgeVersion = "0.5.17-test"
 
 // Port of the old bridge.py log-reading logic. No account APIs / keys are
 // touched - everything comes from the JSONL session logs Claude Code and Codex

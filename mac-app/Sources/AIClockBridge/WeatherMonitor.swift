@@ -43,6 +43,25 @@ final class WeatherMonitor {
     private var value = WeatherSnapshot()
     private var location: Location
     private var timer: Timer?
+    private let textAssetLock = NSLock()
+    private var textAssetKey = ""
+    private var textAssetRevision: UInt32 = 0
+    private var textAssetRaw = Data()
+    private var textAssetRLE = Data()
+
+    static let weatherTextPixelCount = 108 * 32 + 132 * 32 + 130 * 22 + 78 * 28 * 2
+
+    private struct TextLabels {
+        let city: String
+        let date: String
+        let current: String
+        let today: String
+        let tomorrow: String
+
+        var cacheKey: String {
+            [city, date, current, today, tomorrow].joined(separator: "\u{1f}")
+        }
+    }
 
     init() {
         if let data = UserDefaults.standard.data(forKey: Self.locationKey),
@@ -145,6 +164,7 @@ final class WeatherMonitor {
 
     func jsonData() -> Data {
         let snap = snapshot
+        let text = textAssets(for: snap)
         let object: [String: Any] = [
             "city": snap.city,
             "timezone": snap.timeZone,
@@ -165,6 +185,9 @@ final class WeatherMonitor {
             "tomorrow_code": snap.tomorrowCode,
             "tomorrow_text": snap.tomorrowText,
             "updated_unix": Int(snap.updatedAt?.timeIntervalSince1970 ?? 0),
+            "text_rev": Int(text.revision),
+            "text_codec": "wtr1-rle-rgb565",
+            "text_rle_bytes": text.rle.count,
         ]
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
     }
@@ -175,36 +198,163 @@ final class WeatherMonitor {
     /// today 78x28, tomorrow 78x28; all RGB565 big-endian.
     func textRGB565() -> Data {
         let snap = snapshot
+        return textAssets(for: snap).raw
+    }
+
+    /// Header: "WTR1", text revision, decoded pixel count, compressed payload
+    /// CRC32 (all UInt32 big-endian). Payload records are
+    /// [run length: UInt8][RGB565 high][RGB565 low].
+    func textRLE() -> Data {
+        let snap = snapshot
+        return textAssets(for: snap).rle
+    }
+
+    private func textAssets(for snap: WeatherSnapshot) ->
+        (revision: UInt32, raw: Data, rle: Data) {
+        let labels = Self.textLabels(for: snap, now: Date())
+        textAssetLock.lock()
+        if labels.cacheKey == textAssetKey {
+            let result = (textAssetRevision, textAssetRaw, textAssetRLE)
+            textAssetLock.unlock()
+            return result
+        }
+        textAssetLock.unlock()
+
+        let raw = Self.renderWeatherText(labels)
+        let revision = Self.stableTextRevision(labels.cacheKey)
+        let rle = Self.packWeatherRLE(raw, revision: revision)
+
+        textAssetLock.lock()
+        textAssetKey = labels.cacheKey
+        textAssetRevision = revision
+        textAssetRaw = raw
+        textAssetRLE = rle
+        textAssetLock.unlock()
+        return (revision, raw, rle)
+    }
+
+    private static func textLabels(for snap: WeatherSnapshot, now: Date) -> TextLabels {
         let timeZone = TimeZone(identifier: snap.timeZone)
             ?? TimeZone(secondsFromGMT: snap.utcOffsetSeconds) ?? .current
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
-        let parts = calendar.dateComponents([.month, .day, .weekday], from: Date())
+        let parts = calendar.dateComponents([.month, .day, .weekday], from: now)
         let weekdays = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
         let weekday = weekdays[max(0, min(6, (parts.weekday ?? 1) - 1))]
         let date = "\(parts.month ?? 0)月\(parts.day ?? 0)日 \(weekday)"
+        return TextLabels(city: snap.city, date: date,
+                          current: snap.hasData ? snap.currentText : "等待天气",
+                          today: "今天  \(snap.todayText)",
+                          tomorrow: "明天  \(snap.tomorrowText)")
+    }
+
+    private static func renderWeatherText(_ labels: TextLabels) -> Data {
         var output = Data()
-        output.append(Self.renderStrip(snap.city, width: 108, height: 32, fontSize: 17,
+        output.append(Self.renderStrip(labels.city, width: 108, height: 32, fontSize: 17,
                                        weight: .semibold, alignment: .left,
                                        foreground: NSColor(calibratedRed: 125/255, green: 217/255, blue: 1, alpha: 1),
                                        background: NSColor(calibratedRed: 17/255, green: 35/255, blue: 51/255, alpha: 1)))
-        output.append(Self.renderStrip(date, width: 132, height: 32, fontSize: 15,
+        output.append(Self.renderStrip(labels.date, width: 132, height: 32, fontSize: 15,
                                        weight: .medium, alignment: .right,
                                        foreground: NSColor(calibratedWhite: 0.82, alpha: 1),
                                        background: NSColor(calibratedRed: 17/255, green: 35/255, blue: 51/255, alpha: 1)))
-        output.append(Self.renderStrip(snap.hasData ? snap.currentText : "等待天气", width: 130,
+        output.append(Self.renderStrip(labels.current, width: 130,
                                        height: 22, fontSize: 17, weight: .semibold,
                                        alignment: .left,
                                        foreground: NSColor(calibratedRed: 125/255, green: 217/255, blue: 1, alpha: 1),
                                        background: .black))
         let footer = NSColor(calibratedRed: 9/255, green: 19/255, blue: 29/255, alpha: 1)
-        output.append(Self.renderStrip("今天  \(snap.todayText)", width: 78, height: 28,
+        output.append(Self.renderStrip(labels.today, width: 78, height: 28,
                                        fontSize: 12, weight: .medium, alignment: .left,
                                        foreground: NSColor(calibratedWhite: 0.78, alpha: 1), background: footer))
-        output.append(Self.renderStrip("明天  \(snap.tomorrowText)", width: 78, height: 28,
+        output.append(Self.renderStrip(labels.tomorrow, width: 78, height: 28,
                                        fontSize: 12, weight: .medium, alignment: .left,
                                        foreground: NSColor(calibratedWhite: 0.78, alpha: 1), background: footer))
         return output
+    }
+
+    static func stableTextRevision(_ key: String) -> UInt32 {
+        var hash: UInt32 = 2_166_136_261
+        for byte in key.utf8 {
+            hash ^= UInt32(byte)
+            hash &*= 16_777_619
+        }
+        return hash == 0 ? 1 : hash
+    }
+
+    static func packWeatherRLE(_ raw: Data, revision: UInt32) -> Data {
+        guard raw.count == weatherTextPixelCount * 2 else { return Data() }
+        var payload = Data()
+        payload.reserveCapacity(raw.count / 2)
+        var offset = 0
+        while offset + 1 < raw.count {
+            let high = raw[offset]
+            let low = raw[offset + 1]
+            var run = 1
+            while run < 255 {
+                let next = offset + run * 2
+                guard next + 1 < raw.count,
+                      raw[next] == high, raw[next + 1] == low else { break }
+                run += 1
+            }
+            payload.append(UInt8(run))
+            payload.append(high)
+            payload.append(low)
+            offset += run * 2
+        }
+
+        var envelope = Data("WTR1".utf8)
+        appendUInt32BE(revision == 0 ? 1 : revision, to: &envelope)
+        appendUInt32BE(UInt32(weatherTextPixelCount), to: &envelope)
+        appendUInt32BE(crc32(payload), to: &envelope)
+        envelope.append(payload)
+        return envelope
+    }
+
+    static func unpackWeatherRLE(_ envelope: Data) -> (revision: UInt32, raw: Data)? {
+        guard envelope.count >= 19,
+              String(decoding: envelope.prefix(4), as: UTF8.self) == "WTR1" else { return nil }
+        func readUInt32BE(_ offset: Int) -> UInt32 {
+            envelope[offset..<(offset + 4)].reduce(0) { ($0 << 8) | UInt32($1) }
+        }
+        let revision = readUInt32BE(4)
+        guard revision != 0,
+              readUInt32BE(8) == UInt32(weatherTextPixelCount) else { return nil }
+        let payload = Data(envelope.dropFirst(16))
+        guard readUInt32BE(12) == crc32(payload) else { return nil }
+        var raw = Data(capacity: weatherTextPixelCount * 2)
+        var offset = 0
+        var pixels = 0
+        while offset + 2 < payload.count {
+            let run = Int(payload[offset])
+            guard run > 0, pixels + run <= weatherTextPixelCount else { return nil }
+            for _ in 0..<run {
+                raw.append(payload[offset + 1])
+                raw.append(payload[offset + 2])
+            }
+            pixels += run
+            offset += 3
+        }
+        guard offset == payload.count, pixels == weatherTextPixelCount else { return nil }
+        return (revision, raw)
+    }
+
+    static func crc32(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xFFFF_FFFF
+        for byte in data {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                crc = (crc >> 1) ^ ((crc & 1) == 1 ? 0xEDB8_8320 : 0)
+            }
+        }
+        return ~crc
+    }
+
+    private static func appendUInt32BE(_ value: UInt32, to data: inout Data) {
+        data.append(UInt8((value >> 24) & 0xFF))
+        data.append(UInt8((value >> 16) & 0xFF))
+        data.append(UInt8((value >> 8) & 0xFF))
+        data.append(UInt8(value & 0xFF))
     }
 
     private static func renderStrip(_ text: String, width: Int, height: Int, fontSize: CGFloat,

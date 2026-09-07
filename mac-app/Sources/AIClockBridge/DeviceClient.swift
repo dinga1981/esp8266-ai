@@ -382,9 +382,10 @@ final class DeviceClient {
     /// scan) and, if its bridge is unset or it can't reach the one it has,
     /// point it at this Mac. Called from a 60s timer; the /24 scan is
     /// rate-limited to once per 5 minutes.
-    static func healPairingIfNeeded(port: UInt16) {
-        guard Date().timeIntervalSince(devicePollAt) > 180 else { return } // device is polling us
-        guard !healInFlight, Date().timeIntervalSince(lastHealAttempt) > 300 else { return }
+    static func healPairingIfNeeded(port: UInt16, force: Bool = false) {
+        guard force || Date().timeIntervalSince(devicePollAt) > 180 else { return }
+        guard !healInFlight,
+              force || Date().timeIntervalSince(lastHealAttempt) > 300 else { return }
         healInFlight = true
         lastHealAttempt = Date()
         autoPair(progress: { _ in }) { ip in
@@ -392,14 +393,23 @@ final class DeviceClient {
             fetchInfo { result in
                 defer { healInFlight = false }
                 guard case let .success(info) = result, let myIP = localIPv4() else { return }
+                let expected = "\(myIP):\(port)"
                 let stale = info.lastUpdateS < 0 || info.lastUpdateS > 60
-                guard info.bridge.isEmpty || stale else { return }
-                setBridgeHost("\(myIP):\(port)") { error in
+                guard info.bridge.isEmpty || stale || info.bridge != expected else { return }
+                setBridgeHost(expected) { error in
                     FileHandle.standardError.write(Data(
                         "[pair] pushed bridge \(myIP):\(port) to \(info.ip): \(error.map { "\($0.localizedDescription)" } ?? "ok")\n".utf8))
                 }
             }
         }
+    }
+
+    /// A Mac sleep/wake, Wi-Fi roam, DHCP change or interface switch can leave
+    /// the clock pointing at an old address even though the app never exited.
+    /// Re-run pairing once the Network framework reports a usable path.
+    static func recoverAfterNetworkChange(port: UInt16) {
+        FileHandle.standardError.write(Data("[pair] Mac network restored; validating device and bridge address\n".utf8))
+        healPairingIfNeeded(port: port, force: true)
     }
 
     /// LAN IPv4 of this Mac (en0 preferred) — used for one-click "point the

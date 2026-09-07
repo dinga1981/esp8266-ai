@@ -17,6 +17,9 @@ final class HTTPServer {
     /// The ESP8266 polls /status constantly, so this is how the app learns
     /// the device's LAN address without any scanning.
     var onRequest: ((String, String) -> Void)?
+    /// Called after a response is sent with path, remote IP, status, body size,
+    /// and bridge-side duration. Bodies are never exposed to the logger.
+    var onResponse: ((String, String, Int, Int, TimeInterval) -> Void)?
 
     init(port: UInt16, routes: [String: () -> Data], binaryRoutes: [String: () -> Data] = [:],
          postRoutes: [String: (Data) -> Data] = [:]) {
@@ -82,30 +85,38 @@ final class HTTPServer {
     }
 
     private func respond(_ conn: NWConnection, method: String, path: String, requestBody: Data) {
+        let startedAt = Date()
         let clean = path.split(separator: "?").first.map(String.init) ?? path
+        var remoteIP = ""
         if case let .hostPort(host, _) = conn.endpoint {
             // "192.168.1.4%en0" -> "192.168.1.4"
             let ip = String(host.debugDescription.split(separator: "%").first ?? "")
+            remoteIP = ip
             if !ip.isEmpty { onRequest?(clean, ip) }
         }
         let body: Data
         let statusLine: String
+        let statusCode: Int
         let contentType: String
         if method == "POST", let handler = postRoutes[clean] {
             body = handler(requestBody)
             statusLine = "200 OK"
+            statusCode = 200
             contentType = "application/json"
         } else if method == "GET", let provider = routes[clean] {
             body = provider()
             statusLine = "200 OK"
+            statusCode = 200
             contentType = "application/json"
         } else if method == "GET", let provider = binaryRoutes[clean] {
             body = provider()
             statusLine = body.isEmpty ? "404 Not Found" : "200 OK"
+            statusCode = body.isEmpty ? 404 : 200
             contentType = "application/octet-stream"
         } else {
             body = Data("not found".utf8)
             statusLine = "404 Not Found"
+            statusCode = 404
             contentType = "text/plain"
         }
         let header = "HTTP/1.1 \(statusLine)\r\n"
@@ -115,6 +126,10 @@ final class HTTPServer {
             + "Connection: close\r\n\r\n"
         var response = Data(header.utf8)
         response.append(body)
-        conn.send(content: response, completion: .contentProcessed { _ in conn.cancel() })
+        conn.send(content: response, completion: .contentProcessed { [weak self] _ in
+            self?.onResponse?(clean, remoteIP, statusCode, body.count,
+                              Date().timeIntervalSince(startedAt))
+            conn.cancel()
+        })
     }
 }

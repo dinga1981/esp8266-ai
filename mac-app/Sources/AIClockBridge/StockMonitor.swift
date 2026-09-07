@@ -10,9 +10,9 @@ import Foundation
 // Both endpoints are key-free, GB18030-encoded and unofficial. Sina requires a
 // finance.sina.com.cn Referer. Provider-specific codes never leak into settings,
 // so a future provider change will not invalidate the user's watchlist.
-// Polled every 5s; the device and the mirror both render the pre-formatted
-// strings so the firmware stays dumb (and ASCII-only: it shows the code, the
-// CJK name is sent separately as an RGB565 strip).
+// Polled every 5s while the quote page is active and every 30s in the
+// background; the device and mirror both render the pre-formatted strings so
+// the firmware stays dumb (the CJK name is sent separately as a pixel strip).
 final class StockMonitor {
     struct Row {
         let code: String  // ASCII display code: "600519", "00700", "AAPL"
@@ -119,6 +119,7 @@ final class StockMonitor {
     private var rowsBySymbol: [String: Row] = [:]
     private var fetchGeneration = 0
     private var timer: Timer?
+    private var lastBackgroundFetch = Date.distantPast
 
     // The device's font is ASCII-only, so CJK company names go down as Mac-
     // rendered RGB565 strips (same trick as the music title strip): one
@@ -127,12 +128,19 @@ final class StockMonitor {
     static let nameW = 156, nameH = 16
     private var namesRev = 0
     private var namesData = Data([0])
+    private var namesRLEData = Data([0x53, 0x4E, 0x52, 0x31, 0]) // "SNR1" + row count
     private var lastNamesKey = ""
 
     func start() {
         fetch()
         timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.fetch()
+            guard let self else { return }
+            let visible = BridgeDiagnostics.shared.wasRecentlyRequested(
+                paths: ["/stock", "/stock/names.raw", "/stock/names.rle"], within: 20)
+            if visible || Date().timeIntervalSince(self.lastBackgroundFetch) >= 30 {
+                if !visible { self.lastBackgroundFetch = Date() }
+                self.fetch()
+            }
         }
     }
 
@@ -149,7 +157,14 @@ final class StockMonitor {
         lock.lock()
         let rev = namesRev
         lock.unlock()
-        let dict: [String: Any] = ["stocks": stocks, "names_rev": rev]
+        let dict: [String: Any] = [
+            "stocks": stocks,
+            "names_rev": rev,
+            // v0.5.17+ firmware may persist /stock/names.rle in LittleFS.
+            // Older bridges omit this flag, so new firmware safely falls back
+            // to the original stream-and-draw behaviour.
+            "names_cacheable": true,
+        ]
         return (try? JSONSerialization.data(withJSONObject: dict)) ?? Data("{}".utf8)
     }
 
@@ -158,6 +173,54 @@ final class StockMonitor {
         lock.lock()
         defer { lock.unlock() }
         return namesData
+    }
+
+    /// ESP8266 streaming format: "SNR1", row count, then repeated
+    /// [run length: UInt8][RGB565 high][RGB565 low]. Runs may cross scanlines;
+    /// the device reconstructs and draws one row at a time without a frame buffer.
+    func namesRLE() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return namesRLEData
+    }
+
+    static func packNamesRLE(_ raw: Data) -> Data {
+        guard let rowCount = raw.first else { return Data([0x53, 0x4E, 0x52, 0x31, 0]) }
+        let expected = 1 + Int(rowCount) * nameW * nameH * 2
+        guard raw.count == expected else { return Data() }
+        var output = Data([0x53, 0x4E, 0x52, 0x31, rowCount])
+        guard rowCount > 0 else { return output }
+        var offset = 1
+        while offset + 1 < raw.count {
+            let high = raw[offset]
+            let low = raw[offset + 1]
+            var run = 1
+            while run < 255 {
+                let next = offset + run * 2
+                guard next + 1 < raw.count,
+                      raw[next] == high, raw[next + 1] == low else { break }
+                run += 1
+            }
+            output.append(UInt8(run))
+            output.append(high)
+            output.append(low)
+            offset += run * 2
+        }
+        return output
+    }
+
+    /// A content-derived positive revision remains stable across bridge
+    /// restarts. An incrementing counter could collide with an old device
+    /// cache after the Mac app restarted and began counting from zero again.
+    /// The schema prefix can be bumped if font or layout rendering changes.
+    static func stableNamesRevision(_ key: String) -> Int {
+        var hash: UInt32 = 2_166_136_261
+        for byte in ("stock-name-strip-v1\0" + key).utf8 {
+            hash ^= UInt32(byte)
+            hash &*= 16_777_619
+        }
+        let positive = Int(hash & 0x7FFF_FFFF)
+        return positive == 0 ? 1 : positive
     }
 
     private func renderNamesIfNeeded(_ parsed: [Row]) {
@@ -170,10 +233,12 @@ final class StockMonitor {
         for row in parsed.prefix(4) {
             data.append(Self.renderNameStrip(row.name) ?? Data(count: Self.nameW * Self.nameH * 2))
         }
+        let revision = Self.stableNamesRevision(key)
         lock.lock()
         lastNamesKey = key
         namesData = data
-        namesRev += 1
+        namesRLEData = Self.packNamesRLE(data)
+        namesRev = revision
         lock.unlock()
     }
 
