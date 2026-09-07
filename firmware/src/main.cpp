@@ -92,7 +92,22 @@ enum RuntimeStage : uint8_t {
 
 enum RecoveryStep : uint8_t {
   RECOVERY_NONE, RECOVERY_QUICK_RECONNECT, RECOVERY_WIFI_REINIT,
-  RECOVERY_RADIO_RESET, RECOVERY_PROTECTIVE_RESTART, RECOVERY_MANUAL
+  RECOVERY_RADIO_RESET, RECOVERY_PROTECTIVE_RESTART, RECOVERY_MANUAL,
+  RECOVERY_AUTH_REJOIN
+};
+
+enum NetworkTask : uint8_t {
+  NET_TASK_NONE, NET_TASK_BRIDGE, NET_TASK_NET, NET_TASK_MUSIC_META,
+  NET_TASK_MUSIC_COVER, NET_TASK_MUSIC_TEXT, NET_TASK_STOCK_META,
+  NET_TASK_STOCK_NAMES, NET_TASK_WEATHER_META, NET_TASK_WEATHER_TEXT,
+  NET_TASK_MARKET_META, NET_TASK_MARKET_FRAME, NET_TASK_HEALTH,
+  NET_TASK_BOOT_REPORT
+};
+
+enum RequestPhase : uint8_t {
+  REQUEST_NONE, REQUEST_QUEUED, REQUEST_CONNECTING, REQUEST_SENDING,
+  REQUEST_READING, REQUEST_PARSING, REQUEST_RENDERING, REQUEST_CLEANUP,
+  REQUEST_COMPLETE, REQUEST_FAILED
 };
 
 struct RtcRuntimeDiag {
@@ -121,9 +136,22 @@ struct RtcRuntimeDiag {
   uint32_t wifiReinitAtMs;
   uint32_t radioResetAtMs;
   uint32_t protectiveRestartAtMs;
+  uint32_t authRejoinAtMs;
   uint32_t millisAtStage;
+  uint32_t requestStartedAtMs;
+  uint32_t requestDurationMs;
+  uint32_t requestBytes;
+  uint32_t requestFreeHeap;
+  uint32_t requestMaxBlock;
+  int32_t requestCode;
+  uint8_t networkTask;
+  uint8_t requestPhase;
+  uint8_t requestSucceeded;
+  uint8_t reserved3;
 };
 static_assert((sizeof(RtcRuntimeDiag) % 4) == 0, "RTC diagnostics must be word aligned");
+static_assert(32 * 4 + sizeof(RtcRuntimeDiag) <= 512,
+              "RTC diagnostics exceed ESP8266 user memory");
 
 const uint32_t RTC_DIAG_MAGIC = 0x4149434CUL; // "AICL"
 // ESP8266 eboot stores its 128-byte OTA copy command at the start of RTC user
@@ -132,7 +160,7 @@ const uint32_t RTC_DIAG_MAGIC = 0x4149434CUL; // "AICL"
 const uint32_t RTC_DIAG_WORD_OFFSET = 32;
 const char *BOOT_COUNT_FILE = "/boot_count.txt";
 const char *RESTART_HISTORY_FILE = "/restart_history.bin";
-const uint32_t RESTART_HISTORY_MAGIC = 0x52485331UL; // RHS1
+const uint32_t RESTART_HISTORY_MAGIC = 0x52485332UL; // RHS2
 const uint8_t RESTART_HISTORY_CAPACITY = 4;
 
 struct RestartHistoryEntry {
@@ -145,9 +173,24 @@ struct RestartHistoryEntry {
   uint8_t firstReason;
   uint8_t lastReason;
   uint8_t firstWasRecovery;
+  uint8_t lastWasRecovery;
   int8_t firstRssi;
   uint8_t firstChannel;
+  uint8_t networkTask;
+  uint8_t requestPhase;
+  uint8_t requestSucceeded;
+  int32_t requestCode;
+  uint32_t requestDurationMs;
+  uint32_t requestBytes;
+  uint32_t requestFreeHeap;
+  uint32_t requestMaxBlock;
+  uint32_t quickRecoveryAtMs;
+  uint32_t wifiReinitAtMs;
+  uint32_t radioResetAtMs;
+  uint32_t protectiveRestartAtMs;
+  uint32_t authRejoinAtMs;
   char resetReason[24];
+  char resetInfo[96];
 };
 
 struct RestartHistoryStore {
@@ -180,6 +223,15 @@ uint32_t previousQuickRecoveryAtMs = 0;
 uint32_t previousWifiReinitAtMs = 0;
 uint32_t previousRadioResetAtMs = 0;
 uint32_t previousProtectiveRestartAtMs = 0;
+uint32_t previousAuthRejoinAtMs = 0;
+uint8_t previousNetworkTask = NET_TASK_NONE;
+uint8_t previousRequestPhase = REQUEST_NONE;
+bool previousRequestSucceeded = false;
+int32_t previousRequestCode = 0;
+uint32_t previousRequestDurationMs = 0;
+uint32_t previousRequestBytes = 0;
+uint32_t previousRequestFreeHeap = 0;
+uint32_t previousRequestMaxBlock = 0;
 uint8_t diagnosticEffectiveMode = MODE_AUTO;
 uint32_t bootCount = 0;
 char lastResetReason[32] = "Unknown";
@@ -233,9 +285,24 @@ void appendRestartHistory(const RtcRuntimeDiag &previous) {
   entry.firstReason = previous.firstWifiDisconnectReason;
   entry.lastReason = previous.lastWifiDisconnectReason;
   entry.firstWasRecovery = previous.firstDisconnectWasRecovery;
+  entry.lastWasRecovery = previous.lastDisconnectWasRecovery;
   entry.firstRssi = previous.firstWifiRssi;
   entry.firstChannel = previous.firstWifiChannel;
+  entry.networkTask = previous.networkTask;
+  entry.requestPhase = previous.requestPhase;
+  entry.requestSucceeded = previous.requestSucceeded;
+  entry.requestCode = previous.requestCode;
+  entry.requestDurationMs = previous.requestDurationMs;
+  entry.requestBytes = previous.requestBytes;
+  entry.requestFreeHeap = previous.requestFreeHeap;
+  entry.requestMaxBlock = previous.requestMaxBlock;
+  entry.quickRecoveryAtMs = previous.quickRecoveryAtMs;
+  entry.wifiReinitAtMs = previous.wifiReinitAtMs;
+  entry.radioResetAtMs = previous.radioResetAtMs;
+  entry.protectiveRestartAtMs = previous.protectiveRestartAtMs;
+  entry.authRejoinAtMs = previous.authRejoinAtMs;
   strlcpy(entry.resetReason, lastResetReason, sizeof(entry.resetReason));
+  strlcpy(entry.resetInfo, lastResetInfo, sizeof(entry.resetInfo));
   restartHistory.count = min((uint8_t)(restartHistory.count + 1), RESTART_HISTORY_CAPACITY);
   restartHistory.magic = RESTART_HISTORY_MAGIC;
   restartHistory.checksum = restartHistoryChecksum(restartHistory);
@@ -261,6 +328,40 @@ const char *runtimeStageName(uint8_t stage) {
     case STAGE_WIFI_RECOVERY: return "Wi-Fi恢复";
     case STAGE_OTA: return "OTA升级";
     default: return "未知";
+  }
+}
+
+const char *networkTaskName(uint8_t task) {
+  switch (task) {
+    case NET_TASK_BRIDGE: return "桥接状态";
+    case NET_TASK_NET: return "网速";
+    case NET_TASK_MUSIC_META: return "音乐元数据";
+    case NET_TASK_MUSIC_COVER: return "音乐封面";
+    case NET_TASK_MUSIC_TEXT: return "音乐文字";
+    case NET_TASK_STOCK_META: return "四行报价";
+    case NET_TASK_STOCK_NAMES: return "报价名称";
+    case NET_TASK_WEATHER_META: return "天气元数据";
+    case NET_TASK_WEATHER_TEXT: return "天气文字";
+    case NET_TASK_MARKET_META: return "K线元数据";
+    case NET_TASK_MARKET_FRAME: return "K线画面";
+    case NET_TASK_HEALTH: return "桥接健康检查";
+    case NET_TASK_BOOT_REPORT: return "启动诊断上报";
+    default: return "无";
+  }
+}
+
+const char *requestPhaseName(uint8_t phase) {
+  switch (phase) {
+    case REQUEST_QUEUED: return "排队";
+    case REQUEST_CONNECTING: return "连接";
+    case REQUEST_SENDING: return "发送";
+    case REQUEST_READING: return "读取";
+    case REQUEST_PARSING: return "解析";
+    case REQUEST_RENDERING: return "绘制";
+    case REQUEST_CLEANUP: return "清理";
+    case REQUEST_COMPLETE: return "完成";
+    case REQUEST_FAILED: return "失败";
+    default: return "无";
   }
 }
 
@@ -292,6 +393,7 @@ const char *wifiStatusName(uint8_t status) {
 
 const char *recoveryStepName(uint8_t step) {
   switch (step) {
+    case RECOVERY_AUTH_REJOIN: return "握手异常重新关联";
     case RECOVERY_QUICK_RECONNECT: return "快速重连";
     case RECOVERY_WIFI_REINIT: return "重新初始化无线网络";
     case RECOVERY_RADIO_RESET: return "射频关闭/唤醒";
@@ -318,8 +420,10 @@ String wifiBssidText(const uint8_t *bssid) {
 }
 
 String recoveryTimelineText(uint32_t quick, uint32_t reinit,
-                            uint32_t radio, uint32_t restart) {
-  String value = "快速:";
+                            uint32_t radio, uint32_t restart, uint32_t auth) {
+  String value = "握手:";
+  value += auth ? String(auth / 1000UL) + "s" : "--";
+  value += " 快速:";
   value += quick ? String(quick / 1000UL) + "s" : "--";
   value += " 重置:";
   value += reinit ? String(reinit / 1000UL) + "s" : "--";
@@ -345,6 +449,112 @@ void saveRuntimeStage(RuntimeStage stage) {
   rtcRuntimeDiag.wifiStatus = (uint8_t)WiFi.status();
   rtcRuntimeDiag.millisAtStage = millis();
   writeRtcRuntimeDiag();
+}
+
+uint32_t networkRequestCount = 0;
+uint32_t networkRequestFailures = 0;
+uint32_t lastNetworkTaskFinishedMs = 0;
+uint32_t nextNetworkTaskAtMs = 0;
+NetworkTask activeNetworkTask = NET_TASK_NONE;
+RequestPhase activeRequestPhase = REQUEST_NONE;
+int32_t activeRequestCode = 0;
+uint32_t activeRequestBytes = 0;
+
+RuntimeStage runtimeStageForNetworkTask(NetworkTask task) {
+  switch (task) {
+    case NET_TASK_BRIDGE:
+    case NET_TASK_HEALTH:
+    case NET_TASK_BOOT_REPORT: return STAGE_BRIDGE;
+    case NET_TASK_NET: return STAGE_NET;
+    case NET_TASK_MUSIC_META:
+    case NET_TASK_MUSIC_COVER:
+    case NET_TASK_MUSIC_TEXT: return STAGE_MUSIC;
+    case NET_TASK_STOCK_META:
+    case NET_TASK_STOCK_NAMES: return STAGE_STOCK;
+    case NET_TASK_WEATHER_META:
+    case NET_TASK_WEATHER_TEXT: return STAGE_WEATHER;
+    case NET_TASK_MARKET_META: return STAGE_MARKET_META;
+    case NET_TASK_MARKET_FRAME: return STAGE_MARKET_FRAME;
+    default: return STAGE_IDLE;
+  }
+}
+
+void saveRequestBreadcrumb(RequestPhase phase, bool persist) {
+  activeRequestPhase = phase;
+  rtcRuntimeDiag.networkTask = (uint8_t)activeNetworkTask;
+  rtcRuntimeDiag.requestPhase = (uint8_t)phase;
+  rtcRuntimeDiag.requestCode = activeRequestCode;
+  rtcRuntimeDiag.requestBytes = activeRequestBytes;
+  rtcRuntimeDiag.requestFreeHeap = ESP.getFreeHeap();
+  rtcRuntimeDiag.requestMaxBlock = ESP.getMaxFreeBlockSize();
+  rtcRuntimeDiag.requestDurationMs = rtcRuntimeDiag.requestStartedAtMs == 0 ? 0 :
+      millis() - rtcRuntimeDiag.requestStartedAtMs;
+  if (persist) writeRtcRuntimeDiag();
+}
+
+void beginNetworkRequest(NetworkTask task) {
+  activeNetworkTask = task;
+  activeRequestCode = 0;
+  activeRequestBytes = 0;
+  networkRequestCount++;
+  rtcRuntimeDiag.stage = runtimeStageForNetworkTask(task);
+  rtcRuntimeDiag.mode = diagnosticEffectiveMode;
+  rtcRuntimeDiag.wifiStatus = (uint8_t)WiFi.status();
+  rtcRuntimeDiag.millisAtStage = millis();
+  rtcRuntimeDiag.requestStartedAtMs = millis();
+  rtcRuntimeDiag.requestSucceeded = 0;
+  // Persist once at task start. Phase transitions stay in RAM so frequent RTC
+  // writes cannot contend with the ESP8266 Wi-Fi driver's critical sections.
+  saveRequestBreadcrumb(REQUEST_QUEUED, true);
+  delay(1); // let the SDK resume after RTC access before opening a TCP connection
+  Serial.printf("[network] #%lu %s queued heap=%u block=%u\n",
+                (unsigned long)networkRequestCount, networkTaskName(task),
+                ESP.getFreeHeap(), ESP.getMaxFreeBlockSize());
+}
+
+void markRequestPhase(RequestPhase phase) {
+  if (activeNetworkTask != NET_TASK_NONE && activeRequestPhase != phase) {
+    saveRequestBreadcrumb(phase, false);
+  }
+}
+
+void noteRequestResult(int code, int size = -1) {
+  activeRequestCode = code;
+  if (size > 0) activeRequestBytes = (uint32_t)size;
+  rtcRuntimeDiag.requestCode = code;
+  rtcRuntimeDiag.requestBytes = activeRequestBytes;
+}
+
+void finishNetworkRequest(bool success) {
+  const NetworkTask completedTask = activeNetworkTask;
+  if (!success) networkRequestFailures++;
+  rtcRuntimeDiag.requestSucceeded = success ? 1 : 0;
+  // A second and final RTC write records the result. No intermediate network
+  // phase writes are made while TCP is active.
+  saveRequestBreadcrumb(success ? REQUEST_COMPLETE : REQUEST_FAILED, true);
+  Serial.printf("[network] %s %s code=%ld bytes=%lu elapsed=%lums heap=%u\n",
+                networkTaskName((uint8_t)activeNetworkTask), success ? "ok" : "failed",
+                (long)activeRequestCode, (unsigned long)activeRequestBytes,
+                (unsigned long)rtcRuntimeDiag.requestDurationMs, ESP.getFreeHeap());
+  lastNetworkTaskFinishedMs = millis();
+  const bool largeTransfer = completedTask == NET_TASK_MARKET_FRAME ||
+      completedTask == NET_TASK_STOCK_NAMES || completedTask == NET_TASK_MUSIC_COVER ||
+      completedTask == NET_TASK_MUSIC_TEXT || completedTask == NET_TASK_WEATHER_TEXT ||
+      activeRequestBytes >= 4096;
+  nextNetworkTaskAtMs = lastNetworkTaskFinishedMs +
+      (largeTransfer ? NETWORK_LARGE_TASK_GAP_MS : NETWORK_TASK_GAP_MS);
+  rtcRuntimeDiag.stage = STAGE_IDLE; // RAM only; the completed task stays in RTC
+  rtcRuntimeDiag.millisAtStage = lastNetworkTaskFinishedMs;
+  activeNetworkTask = NET_TASK_NONE;
+  activeRequestPhase = REQUEST_NONE;
+  delay(0);
+}
+
+void closeTrackedHttp(HTTPClient &http, WiFiClient &client) {
+  markRequestPhase(REQUEST_CLEANUP);
+  http.end();
+  client.stop();
+  delay(0);
 }
 
 void loadBootDiagnostics() {
@@ -377,6 +587,15 @@ void loadBootDiagnostics() {
     previousWifiReinitAtMs = previous.wifiReinitAtMs;
     previousRadioResetAtMs = previous.radioResetAtMs;
     previousProtectiveRestartAtMs = previous.protectiveRestartAtMs;
+    previousAuthRejoinAtMs = previous.authRejoinAtMs;
+    previousNetworkTask = previous.networkTask;
+    previousRequestPhase = previous.requestPhase;
+    previousRequestSucceeded = previous.requestSucceeded != 0;
+    previousRequestCode = previous.requestCode;
+    previousRequestDurationMs = previous.requestDurationMs;
+    previousRequestBytes = previous.requestBytes;
+    previousRequestFreeHeap = previous.requestFreeHeap;
+    previousRequestMaxBlock = previous.requestMaxBlock;
     rtcRuntimeDiag.sequence = previous.sequence + 1;
   } else {
     rtcRuntimeDiag.sequence = 1;
@@ -466,11 +685,22 @@ bool stockChromeDrawn = false;
 uint32_t stockLastCodeHash[MAX_STOCKS] = {}; // top line (code + CJK name strip)
 uint32_t stockLastValHash[MAX_STOCKS] = {};  // value line (price + pct + direction)
 unsigned long lastStockPollMs = 0;
+bool stockNamesPending = false;
+bool stockNamesDrawPending = false;
+bool stockNamesCacheSupported = false;
+bool stockNamesCacheValid = false;
+uint8_t stockNamesCacheCount = 0;
+uint8_t stockNamesFailures = 0;
+unsigned long stockNamesRetryAtMs = 0;
+unsigned long lastStockNamesAttemptMs = 0;
 // CJK names come as Mac-rendered RGB565 strips (GET /stock/names.raw, one
-// 156x16 strip per row) - names_rev says when to re-fetch. -1 = not drawn.
+// 156x16 strip per row). v0.5.17 caches the compressed stream in LittleFS;
+// names_rev says when the content actually changed. Zero = not available.
 const int STOCK_NAME_W = 156, STOCK_NAME_H = 16;
-int stockNamesRev = -1;
-int stockNamesDrawnRev = -1;
+uint32_t stockNamesRev = 0;
+uint32_t stockNamesDrawnRev = 0;
+uint32_t stockNamesCachedRev = 0;
+bool stockNamesPreferRle = true;
 
 // ---------- full-screen K-line market mode ----------
 // This is a separate page from the four-row stock page above. Unlike the
@@ -478,7 +708,7 @@ int stockNamesDrawnRev = -1;
 // frame buffer. It allocates the compressed frame only during an update,
 // validates the entire envelope and CRC, draws one row at a time through the
 // existing 480-byte rowBuf, then immediately releases the allocation.
-const unsigned long MARKET_POLL_INTERVAL_MS = 2000;
+const unsigned long MARKET_POLL_INTERVAL_MS = 5000;
 const unsigned long MARKET_HTTP_TIMEOUT_MS = 2500;
 const unsigned long MARKET_READ_TIMEOUT_MS = 1200;
 const unsigned long MARKET_TOTAL_TIMEOUT_MS = 5000;
@@ -491,6 +721,10 @@ const uint16_t MARKET_PALETTE_RGB565[16] PROGMEM = {
 unsigned long lastMarketPollMs = 0;
 uint64_t lastMarketFrameVersion = 0;
 char lastMarketFrameSession[40] = "";
+uint64_t pendingMarketFrameVersion = 0;
+size_t pendingMarketFrameBytes = 0;
+bool pendingMarketFramePalette4 = false;
+unsigned long lastMarketFrameAttemptMs = 0;
 bool marketAutoDwellKnown = false;
 unsigned long marketAutoDwellMs = 0;
 
@@ -512,6 +746,15 @@ unsigned long lastWeatherPollMs = 0;
 unsigned long lastWeatherClockMs = 0;
 bool weatherChromeDrawn = false;
 bool weatherDirty = false;
+bool weatherTextPending = false;
+bool weatherTextDrawPending = false;
+bool weatherTextCacheValid = false;
+bool weatherTextLegacyRaw = false;
+uint32_t weatherTextRev = 0;
+uint32_t weatherTextCachedRev = 0;
+uint8_t weatherTextFailures = 0;
+unsigned long weatherTextRetryAtMs = 0;
+unsigned long lastWeatherTextAttemptMs = 0;
 
 char musicTitle[72] = "";
 char musicArtist[48] = "";
@@ -522,6 +765,10 @@ int musicTextRev = -1;
 bool musicHasArtwork = false;
 bool musicChromeDrawn = false;
 unsigned long lastMusicPollMs = 0;
+bool musicCoverPending = false;
+bool musicTextPending = false;
+unsigned long lastMusicCoverAttemptMs = 0;
+unsigned long lastMusicTextAttemptMs = 0;
 
 int claudeFrame = 0;
 int codexFrame = 0;
@@ -564,6 +811,11 @@ CodexStatus codexStatus;
 
 unsigned long lastPollMs = 0;
 unsigned long lastSuccessMs = 0;
+unsigned long lastBridgeHealthPollMs = 0;
+int lastBridgeHealthHttpCode = 0;
+bool lastBridgeHealthHealthy = false;
+bool bootReportPending = true;
+unsigned long lastBootReportAttemptMs = 0;
 bool everPolled = false;
 bool mainUiShown = false;      // false while the config-portal screen is up
 bool webServerStarted = false; // deferred: port 80 clashes with the portal
@@ -608,6 +860,7 @@ uint32_t quickRecoveryAtMs = 0;
 uint32_t wifiReinitAtMs = 0;
 uint32_t radioResetAtMs = 0;
 uint32_t protectiveRestartAtMs = 0;
+uint32_t authRejoinAtMs = 0;
 int8_t lastConnectedWifiRssi = 0;
 uint8_t lastConnectedWifiChannel = 0;
 uint8_t lastConnectedWifiBssid[6] = {};
@@ -618,8 +871,11 @@ bool wifiEverGotIp = false;
 bool wifiSoftRecoveryDone = false;
 bool wifiHardRecoveryDone = false;
 bool wifiRadioRecoveryDone = false;
+bool wifiAuthRecoveryPending = false;
+bool wifiAuthRecoveryDone = false;
+unsigned long wifiAuthRecoveryAtMs = 0;
 bool webServerNeedsRestart = false;
-const unsigned long WIFI_TRAFFIC_COOLDOWN_MS = 5000UL;
+const unsigned long WIFI_TRAFFIC_COOLDOWN_MS = NETWORK_STARTUP_GRACE_MS;
 bool networkTrafficPaused = true;
 unsigned long networkTrafficResumeAtMs = 0;
 
@@ -685,6 +941,7 @@ void syncWifiEvidenceToRtc() {
   rtcRuntimeDiag.wifiReinitAtMs = wifiReinitAtMs;
   rtcRuntimeDiag.radioResetAtMs = radioResetAtMs;
   rtcRuntimeDiag.protectiveRestartAtMs = protectiveRestartAtMs;
+  rtcRuntimeDiag.authRejoinAtMs = authRejoinAtMs;
 }
 
 void persistRecoverySnapshot(RecoveryStep step) {
@@ -699,6 +956,7 @@ void persistRecoverySnapshot(RecoveryStep step) {
   else if (step == RECOVERY_WIFI_REINIT || step == RECOVERY_MANUAL) wifiReinitAtMs = elapsed;
   else if (step == RECOVERY_RADIO_RESET) radioResetAtMs = elapsed;
   else if (step == RECOVERY_PROTECTIVE_RESTART) protectiveRestartAtMs = elapsed;
+  else if (step == RECOVERY_AUTH_REJOIN) authRejoinAtMs = elapsed;
   syncWifiEvidenceToRtc();
   rtcRuntimeDiag.bridgeFailures = bridgeConsecutiveFailures;
   rtcRuntimeDiag.wifiDisconnectCount = wifiDisconnectCount;
@@ -736,6 +994,10 @@ void hardReconnectWiFi(const char *reason, RecoveryStep step = RECOVERY_WIFI_REI
   setRecoveryAction(reason, step);
   armRecoveryDisconnect(step);
   WiFi.disconnect(false);
+  delay(0);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.begin();
   webServerNeedsRestart = webServerStarted;
 }
@@ -760,6 +1022,11 @@ void maintainConnectivity(unsigned long nowMs) {
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiDisconnectedSinceMs == 0) wifiDisconnectedSinceMs = max(nowMs, 1UL);
     const unsigned long downFor = nowMs - wifiDisconnectedSinceMs;
+    if (wifiAuthRecoveryPending && !wifiAuthRecoveryDone &&
+        (long)(nowMs - wifiAuthRecoveryAtMs) >= 0) {
+      wifiAuthRecoveryDone = true;
+      hardReconnectWiFi("WPA握手异常：重新关联接入点", RECOVERY_AUTH_REJOIN);
+    }
     if (downFor >= 15000UL && !wifiSoftRecoveryDone) {
       wifiSoftRecoveryDone = true;
       setRecoveryAction("Wi-Fi断线15秒：尝试快速重连", RECOVERY_QUICK_RECONNECT);
@@ -786,6 +1053,9 @@ void maintainConnectivity(unsigned long nowMs) {
   wifiSoftRecoveryDone = false;
   wifiHardRecoveryDone = false;
   wifiRadioRecoveryDone = false;
+  wifiAuthRecoveryPending = false;
+  wifiAuthRecoveryDone = false;
+  wifiAuthRecoveryAtMs = 0;
 
   // A bridge outage is not a Wi-Fi outage: the Mac may be asleep, the app may
   // be restarting, or a single HTTP request may have failed. Keep collecting
@@ -1052,7 +1322,8 @@ void drawStaticChrome() {
 // matches the "urgent, look now" state from the reference signal-light design.
 bool bridgeStale() {
   if (!everPolled) return true;
-  return (millis() - lastSuccessMs) >= 2UL * BRIDGE_POLL_INTERVAL_MS;
+  return (millis() - lastSuccessMs) >=
+      2UL * BRIDGE_DATA_PAGE_POLL_INTERVAL_MS + NETWORK_LARGE_TASK_GAP_MS;
 }
 
 // True when the app currently on screen is waiting on a permission/approval
@@ -1869,19 +2140,25 @@ bool handleNetPayload(const String &payload) {
 }
 
 // Refills the sample queue from the bridge's /net endpoint.
-void pollNet() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+bool pollNet() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
   WiFiClient client;
   HTTPClient http;
   String url = "http://" + bridgeHost + "/net";
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return;
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, url)) { noteRequestResult(-1001); client.stop(); return false; }
+  markRequestPhase(REQUEST_SENDING);
   int code = http.GET();
+  noteRequestResult(code, http.getSize());
+  bool ok = false;
   if (code == HTTP_CODE_OK) {
+    markRequestPhase(REQUEST_PARSING);
     JsonDocument doc;
-    if (!deserializeJson(doc, *http.getStreamPtr())) applyNetJson(doc);
+    if (!deserializeJson(doc, *http.getStreamPtr())) ok = applyNetJson(doc);
   }
-  http.end();
+  closeTrackedHttp(http, client);
+  return ok;
 }
 
 String timeText(int sec) {
@@ -1915,12 +2192,16 @@ bool drawMusicCoverFromBridge() {
   HTTPClient http;
   String url = "http://" + bridgeHost + "/music/cover.raw";
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return false;
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, url)) { noteRequestResult(-1001); client.stop(); return false; }
+  markRequestPhase(REQUEST_SENDING);
   int code = http.GET();
+  noteRequestResult(code, http.getSize());
   if (code != HTTP_CODE_OK) {
-    http.end();
+    closeTrackedHttp(http, client);
     return false;
   }
+  markRequestPhase(REQUEST_READING);
   WiFiClient *stream = http.getStreamPtr();
   const int x = (SCREEN_W - MUSIC_COVER_W) / 2;
   const int y = 14;
@@ -1935,7 +2216,7 @@ bool drawMusicCoverFromBridge() {
     tft.pushImage(x, y + r, MUSIC_COVER_W, 1, rowBuf);
     yield();
   }
-  http.end();
+  closeTrackedHttp(http, client);
   return ok;
 }
 
@@ -1947,12 +2228,16 @@ bool drawMusicTextFromBridge() {
   HTTPClient http;
   String url = "http://" + bridgeHost + "/music/text.raw";
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return false;
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, url)) { noteRequestResult(-1001); client.stop(); return false; }
+  markRequestPhase(REQUEST_SENDING);
   int code = http.GET();
+  noteRequestResult(code, http.getSize());
   if (code != HTTP_CODE_OK) {
-    http.end();
+    closeTrackedHttp(http, client);
     return false;
   }
+  markRequestPhase(REQUEST_READING);
   WiFiClient *stream = http.getStreamPtr();
   const size_t rowBytes = (size_t)MUSIC_TEXT_W * 2;
   bool ok = true;
@@ -1965,7 +2250,7 @@ bool drawMusicTextFromBridge() {
     tft.pushImage(MUSIC_TEXT_X, MUSIC_TEXT_Y + r, MUSIC_TEXT_W, 1, rowBuf);
     yield();
   }
-  http.end();
+  closeTrackedHttp(http, client);
   return ok;
 }
 
@@ -1992,10 +2277,12 @@ void drawMusicScreen(bool coverChanged, bool textChanged) {
     musicChromeDrawn = true;
   }
   if (coverChanged) {
-    if (!drawMusicCoverFromBridge()) drawMusicCoverPlaceholder();
+    musicCoverPending = musicHasArtwork;
+    if (!musicHasArtwork) drawMusicCoverPlaceholder();
   }
   if (textChanged) {
-    if (!drawMusicTextFromBridge()) drawMusicTextFallback();
+    musicTextPending = true;
+    drawMusicTextFallback();
   }
 
   const int bx = 20, by = 204, bw = 200, bh = 8;
@@ -2011,15 +2298,20 @@ void drawMusicScreen(bool coverChanged, bool textChanged) {
   tft.drawString(timeText(musicElapsed) + " / " + timeText(musicDuration), SCREEN_CX, 220, 1);
 }
 
-void pollMusic() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+bool pollMusic() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
   WiFiClient client;
   HTTPClient http;
   String url = "http://" + bridgeHost + "/music";
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return;
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, url)) { noteRequestResult(-1001); client.stop(); return false; }
+  markRequestPhase(REQUEST_SENDING);
   int code = http.GET();
+  noteRequestResult(code, http.getSize());
+  bool ok = false;
   if (code == HTTP_CODE_OK) {
+    markRequestPhase(REQUEST_PARSING);
     JsonDocument doc;
     if (!deserializeJson(doc, *http.getStreamPtr())) {
       strlcpy(musicTitle, doc["title"] | "", sizeof(musicTitle));
@@ -2036,9 +2328,11 @@ void pollMusic() {
       bool textChanged = tRev != musicTextRev;
       musicTextRev = tRev;
       drawMusicScreen(coverChanged, textChanged);
+      ok = true;
     }
   }
-  http.end();
+  closeTrackedHttp(http, client);
+  return ok;
 }
 
 // ---------- stock watchlist screen ----------
@@ -2054,7 +2348,27 @@ bool applyStockJson(JsonDocument &doc) {
     stocks[stockCount].up = s["up"] | 0;
     stockCount++;
   }
-  stockNamesRev = doc["names_rev"] | -1;
+  const uint32_t incomingNamesRev = doc["names_rev"] | (uint32_t)0;
+  stockNamesCacheSupported = doc["names_cacheable"] | false;
+  stockNamesRev = incomingNamesRev;
+  if (stockCount == 0 || stockNamesRev == 0) {
+    stockNamesPending = false;
+    stockNamesDrawPending = false;
+  } else if (stockNamesCacheSupported && stockNamesCacheValid &&
+             stockNamesCachedRev == stockNamesRev &&
+             stockNamesCacheCount == stockCount) {
+    stockNamesPending = false;
+    stockNamesFailures = 0;
+    stockNamesRetryAtMs = 0;
+    if (diagnosticEffectiveMode == MODE_STOCK &&
+        stockNamesDrawnRev != stockNamesRev) {
+      stockNamesDrawPending = true;
+    }
+  } else if (diagnosticEffectiveMode == MODE_STOCK &&
+             stockNamesDrawnRev != stockNamesRev) {
+    stockNamesPending = true;
+    stockNamesRetryAtMs = 0;
+  }
   stockEverLoaded = true;
   stockDirty = true;
   return true;
@@ -2073,24 +2387,27 @@ uint32_t stockHashAppend(uint32_t hash, const char *text) {
   return hash;
 }
 
-// Streams the Mac-rendered name strips and blits one per row (top line,
-// right of the ASCII code). Wired-only mode has no HTTP: codes still show.
-bool drawStockNames() {
+// Legacy raw endpoint retained for pairing with an older Mac bridge.
+bool drawStockNamesRaw() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
   WiFiClient client;
   HTTPClient http;
   String url = "http://" + bridgeHost + "/stock/names.raw";
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return false;
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, url)) { noteRequestResult(-1001); client.stop(); return false; }
+  markRequestPhase(REQUEST_SENDING);
   int code = http.GET();
+  noteRequestResult(code, http.getSize());
   if (code != HTTP_CODE_OK) {
-    http.end();
+    closeTrackedHttp(http, client);
     return false;
   }
+  markRequestPhase(REQUEST_READING);
   WiFiClient *stream = http.getStreamPtr();
   uint8_t cnt = 0;
   if (stream->readBytes(&cnt, 1) != 1) {
-    http.end();
+    closeTrackedHttp(http, client);
     return false;
   }
   const size_t rowBytes = (size_t)STOCK_NAME_W * 2;
@@ -2106,23 +2423,380 @@ bool drawStockNames() {
       yield();
     }
   }
-  http.end();
+  closeTrackedHttp(http, client);
   return ok;
 }
 
-void pollStock() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+// RLE name strips avoid transferring ~20KB of mostly-black RGB565 pixels each
+// time the carousel re-enters the quote page. Format: "SNR1", row count, then
+// [run:1][RGB565 big-endian:2]. Decode directly into the existing one-row
+// scratch buffer, so compressed and decoded frames never coexist in heap.
+bool drawStockNamesRle() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + bridgeHost + "/stock/names.rle";
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, url)) { noteRequestResult(-1001); client.stop(); return false; }
+  markRequestPhase(REQUEST_SENDING);
+  const int code = http.GET();
+  noteRequestResult(code, http.getSize());
+  if (code != HTTP_CODE_OK) {
+    closeTrackedHttp(http, client);
+    return false;
+  }
+  markRequestPhase(REQUEST_READING);
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t header[5] = {};
+  if (stream->readBytes(header, sizeof(header)) != (int)sizeof(header) ||
+      memcmp(header, "SNR1", 4) != 0 || header[4] > MAX_STOCKS) {
+    closeTrackedHttp(http, client);
+    return false;
+  }
+  const uint8_t count = header[4];
+  const uint32_t totalPixels = (uint32_t)count * STOCK_NAME_W * STOCK_NAME_H;
+  uint32_t emitted = 0;
+  int item = 0, row = 0, column = 0;
+  bool ok = true;
+  while (emitted < totalPixels && ok) {
+    uint8_t runData[3] = {};
+    if (stream->readBytes(runData, sizeof(runData)) != (int)sizeof(runData) ||
+        runData[0] == 0 || emitted + runData[0] > totalPixels) {
+      ok = false;
+      break;
+    }
+    // Match the byte order produced when the raw big-endian stream is read
+    // directly into the little-endian uint16_t row buffer.
+    const uint16_t pixel = (uint16_t)runData[1] | ((uint16_t)runData[2] << 8);
+    for (uint16_t n = 0; n < runData[0]; ++n) {
+      rowBuf[column++] = pixel;
+      emitted++;
+      if (column == STOCK_NAME_W) {
+        if (item < stockCount) {
+          const int y0 = 10 + item * 54;
+          tft.pushImage(70, y0 + row, STOCK_NAME_W, 1, rowBuf);
+        }
+        column = 0;
+        if (++row == STOCK_NAME_H) { row = 0; item++; }
+        yield();
+      }
+    }
+  }
+  ok = ok && emitted == totalPixels && column == 0 && item == count;
+  closeTrackedHttp(http, client);
+  return ok;
+}
+
+bool drawStockNames() {
+  if (stockNamesPreferRle) {
+    const bool ok = drawStockNamesRle();
+    if (!ok) stockNamesPreferRle = false; // next scheduler pass uses old bridge endpoint
+    return ok;
+  }
+  return drawStockNamesRaw();
+}
+
+// Local cache format: "SNC2" + stable names_rev (UInt32 BE) + the bridge's
+// unchanged SNR1 payload + CRC32 of that payload (UInt32 BE). Keeping the
+// network protocol backward-compatible means older firmware can continue to
+// consume /stock/names.rle, while v0.5.17+ downloads it only after a revision
+// change and redraws future page visits entirely from LittleFS.
+const size_t STOCK_NAMES_CACHE_PREFIX_BYTES = 8;
+const size_t STOCK_NAMES_CACHE_SUFFIX_BYTES = 4;
+
+uint32_t stockNamesReadU32BE(const uint8_t *data) {
+  return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+         ((uint32_t)data[2] << 8) | data[3];
+}
+
+void stockNamesWriteU32BE(uint32_t value, uint8_t *data) {
+  data[0] = (uint8_t)(value >> 24);
+  data[1] = (uint8_t)(value >> 16);
+  data[2] = (uint8_t)(value >> 8);
+  data[3] = (uint8_t)value;
+}
+
+uint32_t stockNamesCrc32Byte(uint32_t crc, uint8_t value) {
+  crc ^= value;
+  for (int bit = 0; bit < 8; ++bit) {
+    crc = (crc >> 1) ^ ((crc & 1U) ? 0xEDB88320UL : 0U);
+  }
+  return crc;
+}
+
+bool validateStockNamesCache(const char *path, uint32_t desiredRev,
+                             uint32_t &revisionOut, uint8_t &countOut) {
+  File file = LittleFS.open(path, "r");
+  const size_t minimumBytes = STOCK_NAMES_CACHE_PREFIX_BYTES + 5 + 3 +
+                              STOCK_NAMES_CACHE_SUFFIX_BYTES;
+  if (!file || file.size() < minimumBytes ||
+      file.size() > STOCK_NAMES_RLE_MAX_BYTES + STOCK_NAMES_CACHE_PREFIX_BYTES +
+                    STOCK_NAMES_CACHE_SUFFIX_BYTES) {
+    if (file) file.close();
+    return false;
+  }
+
+  uint8_t prefix[STOCK_NAMES_CACHE_PREFIX_BYTES] = {};
+  uint8_t snrHeader[5] = {};
+  if (file.read(prefix, sizeof(prefix)) != (int)sizeof(prefix) ||
+      memcmp(prefix, "SNC2", 4) != 0 ||
+      file.read(snrHeader, sizeof(snrHeader)) != (int)sizeof(snrHeader) ||
+      memcmp(snrHeader, "SNR1", 4) != 0 || snrHeader[4] == 0 ||
+      snrHeader[4] > MAX_STOCKS) {
+    file.close();
+    return false;
+  }
+  const uint32_t revision = stockNamesReadU32BE(prefix + 4);
+  if (revision == 0 || (desiredRev != 0 && revision != desiredRev)) {
+    file.close();
+    return false;
+  }
+
+  const size_t payloadEnd = file.size() - STOCK_NAMES_CACHE_SUFFIX_BYTES;
+  const uint32_t expectedPixels =
+      (uint32_t)snrHeader[4] * STOCK_NAME_W * STOCK_NAME_H;
+  uint32_t emitted = 0;
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (uint8_t b : snrHeader) crc = stockNamesCrc32Byte(crc, b);
+  while (file.position() < payloadEnd && emitted < expectedPixels) {
+    if (payloadEnd - file.position() < 3) { file.close(); return false; }
+    uint8_t record[3] = {};
+    if (file.read(record, sizeof(record)) != (int)sizeof(record) ||
+        record[0] == 0 || emitted + record[0] > expectedPixels) {
+      file.close();
+      return false;
+    }
+    crc = stockNamesCrc32Byte(crc, record[0]);
+    crc = stockNamesCrc32Byte(crc, record[1]);
+    crc = stockNamesCrc32Byte(crc, record[2]);
+    emitted += record[0];
+    yield();
+  }
+  uint8_t storedCrc[4] = {};
+  const bool structureOK = emitted == expectedPixels &&
+                           file.position() == payloadEnd &&
+                           file.read(storedCrc, sizeof(storedCrc)) ==
+                               (int)sizeof(storedCrc);
+  file.close();
+  if (!structureOK || (~crc) != stockNamesReadU32BE(storedCrc)) return false;
+  revisionOut = revision;
+  countOut = snrHeader[4];
+  return true;
+}
+
+bool installStockNamesCache(const char *temporaryPath, uint32_t revision) {
+  uint32_t validatedRevision = 0;
+  uint8_t validatedCount = 0;
+  if (!validateStockNamesCache(temporaryPath, revision, validatedRevision,
+                               validatedCount)) {
+    LittleFS.remove(temporaryPath);
+    return false;
+  }
+  LittleFS.remove(STOCK_NAMES_CACHE_BACKUP_FILE);
+  const bool hadCache = LittleFS.exists(STOCK_NAMES_CACHE_FILE);
+  if (hadCache && !LittleFS.rename(STOCK_NAMES_CACHE_FILE,
+                                   STOCK_NAMES_CACHE_BACKUP_FILE)) {
+    LittleFS.remove(temporaryPath);
+    return false;
+  }
+  if (!LittleFS.rename(temporaryPath, STOCK_NAMES_CACHE_FILE)) {
+    if (hadCache) LittleFS.rename(STOCK_NAMES_CACHE_BACKUP_FILE,
+                                  STOCK_NAMES_CACHE_FILE);
+    LittleFS.remove(temporaryPath);
+    return false;
+  }
+  LittleFS.remove(STOCK_NAMES_CACHE_BACKUP_FILE);
+  stockNamesCachedRev = validatedRevision;
+  stockNamesCacheCount = validatedCount;
+  stockNamesCacheValid = true;
+  return true;
+}
+
+void loadStockNamesCache() {
+  if (!LittleFS.exists(STOCK_NAMES_CACHE_FILE) &&
+      LittleFS.exists(STOCK_NAMES_CACHE_BACKUP_FILE)) {
+    LittleFS.rename(STOCK_NAMES_CACHE_BACKUP_FILE, STOCK_NAMES_CACHE_FILE);
+  }
+  uint32_t revision = 0;
+  uint8_t count = 0;
+  stockNamesCacheValid = validateStockNamesCache(
+      STOCK_NAMES_CACHE_FILE, 0, revision, count);
+  if (!stockNamesCacheValid && LittleFS.exists(STOCK_NAMES_CACHE_BACKUP_FILE)) {
+    uint32_t backupRevision = 0;
+    uint8_t backupCount = 0;
+    if (validateStockNamesCache(STOCK_NAMES_CACHE_BACKUP_FILE, 0,
+                                backupRevision, backupCount)) {
+      LittleFS.remove(STOCK_NAMES_CACHE_FILE);
+      if (LittleFS.rename(STOCK_NAMES_CACHE_BACKUP_FILE,
+                          STOCK_NAMES_CACHE_FILE)) {
+        stockNamesCacheValid = true;
+        revision = backupRevision;
+        count = backupCount;
+      }
+    }
+  }
+  stockNamesCachedRev = stockNamesCacheValid ? revision : 0;
+  stockNamesCacheCount = stockNamesCacheValid ? count : 0;
+  LittleFS.remove(STOCK_NAMES_CACHE_TMP_FILE);
+  if (stockNamesCacheValid) LittleFS.remove(STOCK_NAMES_CACHE_BACKUP_FILE);
+  Serial.printf("[stock] names cache=%s rev=%lu rows=%u\n",
+                stockNamesCacheValid ? "valid" : "missing",
+                (unsigned long)stockNamesCachedRev, stockNamesCacheCount);
+}
+
+bool downloadStockNamesCache() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0 ||
+      stockNamesRev == 0) return false;
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, "http://" + bridgeHost + "/stock/names.rle")) {
+    noteRequestResult(-1001); client.stop(); return false;
+  }
+  markRequestPhase(REQUEST_SENDING);
+  const int code = http.GET();
+  const int expectedBytes = http.getSize();
+  noteRequestResult(code, expectedBytes);
+  if (code != HTTP_CODE_OK || expectedBytes < 8 ||
+      expectedBytes > STOCK_NAMES_RLE_MAX_BYTES) {
+    closeTrackedHttp(http, client);
+    return false;
+  }
+
+  File output = LittleFS.open(STOCK_NAMES_CACHE_TMP_FILE, "w");
+  if (!output) {
+    noteRequestResult(-1003);
+    closeTrackedHttp(http, client);
+    return false;
+  }
+  uint8_t prefix[STOCK_NAMES_CACHE_PREFIX_BYTES] = {'S', 'N', 'C', '2'};
+  stockNamesWriteU32BE(stockNamesRev, prefix + 4);
+  bool ok = output.write(prefix, sizeof(prefix)) == sizeof(prefix);
+  markRequestPhase(REQUEST_READING);
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buffer[256];
+  size_t received = 0;
+  uint32_t crc = 0xFFFFFFFFUL;
+  unsigned long deadline = millis() + BRIDGE_HTTP_TIMEOUT_MS;
+  while (ok && received < (size_t)expectedBytes) {
+    const int available = stream->available();
+    if (available > 0) {
+      const size_t wanted = min((size_t)available,
+                                min(sizeof(buffer), (size_t)expectedBytes - received));
+      const int count = stream->read(buffer, wanted);
+      if (count > 0) {
+        if (output.write(buffer, count) != (size_t)count) { ok = false; break; }
+        for (int i = 0; i < count; ++i) crc = stockNamesCrc32Byte(crc, buffer[i]);
+        received += count;
+        activeRequestBytes = received;
+        deadline = millis() + BRIDGE_HTTP_TIMEOUT_MS;
+        yield();
+        continue;
+      }
+    }
+    if ((long)(millis() - deadline) >= 0) { ok = false; break; }
+    delay(1);
+  }
+  if (ok && received == (size_t)expectedBytes) {
+    uint8_t suffix[4];
+    stockNamesWriteU32BE(~crc, suffix);
+    ok = output.write(suffix, sizeof(suffix)) == sizeof(suffix);
+  }
+  output.close();
+  closeTrackedHttp(http, client);
+  if (!ok || received != (size_t)expectedBytes) {
+    LittleFS.remove(STOCK_NAMES_CACHE_TMP_FILE);
+    return false;
+  }
+  markRequestPhase(REQUEST_PARSING);
+  return installStockNamesCache(STOCK_NAMES_CACHE_TMP_FILE, stockNamesRev);
+}
+
+bool drawStockNamesFromCache() {
+  if (!stockNamesCacheValid || stockNamesCachedRev != stockNamesRev ||
+      stockNamesCacheCount != stockCount) return false;
+  File file = LittleFS.open(STOCK_NAMES_CACHE_FILE, "r");
+  if (!file) { stockNamesCacheValid = false; return false; }
+  uint8_t prefix[STOCK_NAMES_CACHE_PREFIX_BYTES] = {};
+  uint8_t header[5] = {};
+  if (file.read(prefix, sizeof(prefix)) != (int)sizeof(prefix) ||
+      memcmp(prefix, "SNC2", 4) != 0 ||
+      stockNamesReadU32BE(prefix + 4) != stockNamesRev ||
+      file.read(header, sizeof(header)) != (int)sizeof(header) ||
+      memcmp(header, "SNR1", 4) != 0 || header[4] != stockCount) {
+    file.close(); stockNamesCacheValid = false; return false;
+  }
+  const uint32_t totalPixels = (uint32_t)stockCount * STOCK_NAME_W * STOCK_NAME_H;
+  uint32_t emitted = 0;
+  int item = 0, row = 0, column = 0;
+  bool ok = true;
+  while (emitted < totalPixels && ok) {
+    uint8_t record[3] = {};
+    if (file.read(record, sizeof(record)) != (int)sizeof(record) ||
+        record[0] == 0 || emitted + record[0] > totalPixels) {
+      ok = false;
+      break;
+    }
+    const uint16_t pixel = (uint16_t)record[1] | ((uint16_t)record[2] << 8);
+    for (uint16_t n = 0; n < record[0]; ++n) {
+      rowBuf[column++] = pixel;
+      emitted++;
+      if (column == STOCK_NAME_W) {
+        const int y0 = 10 + item * 54;
+        tft.pushImage(70, y0 + row, STOCK_NAME_W, 1, rowBuf);
+        column = 0;
+        if (++row == STOCK_NAME_H) { row = 0; item++; }
+        yield();
+      }
+    }
+  }
+  file.close();
+  return ok && emitted == totalPixels && column == 0 && item == stockCount;
+}
+
+unsigned long stockNamesRetryDelayMs() {
+  if (stockNamesFailures <= 1) return 10000UL;
+  if (stockNamesFailures == 2) return 30000UL;
+  return 300000UL;
+}
+
+bool updateStockNamesAsset() {
+  const bool ok = stockNamesCacheSupported ? downloadStockNamesCache()
+                                            : drawStockNames();
+  if (ok) {
+    stockNamesFailures = 0;
+    stockNamesRetryAtMs = 0;
+    stockNamesPending = false;
+    if (stockNamesCacheSupported) stockNamesDrawPending = true;
+    else stockNamesDrawnRev = stockNamesRev;
+    return true;
+  }
+  if (stockNamesFailures < 255) stockNamesFailures++;
+  stockNamesRetryAtMs = millis() + stockNamesRetryDelayMs();
+  return false;
+}
+
+bool pollStock() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
   WiFiClient client;
   HTTPClient http;
   String url = "http://" + bridgeHost + "/stock";
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return;
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, url)) { noteRequestResult(-1001); client.stop(); return false; }
+  markRequestPhase(REQUEST_SENDING);
   int code = http.GET();
+  noteRequestResult(code, http.getSize());
+  bool ok = false;
   if (code == HTTP_CODE_OK) {
+    markRequestPhase(REQUEST_PARSING);
     JsonDocument doc;
-    if (!deserializeJson(doc, *http.getStreamPtr())) applyStockJson(doc);
+    if (!deserializeJson(doc, *http.getStreamPtr())) ok = applyStockJson(doc);
   }
-  http.end();
+  closeTrackedHttp(http, client);
+  return ok;
 }
 
 // 54px per row: small grey code on top, big font-4 price (white) on the left
@@ -2136,7 +2810,8 @@ void drawStockScreen() {
       stockLastCodeHash[i] = UINT32_MAX; // force repaint
       stockLastValHash[i] = UINT32_MAX;
     }
-    stockNamesDrawnRev = -1;
+    stockNamesDrawnRev = 0;
+    stockNamesDrawPending = false;
     tft.setTextDatum(TC_DATUM);
     tft.setTextColor(0x7BEF, TFT_BLACK);
     tft.drawString("STOCKS", SCREEN_CX, 228, 1);
@@ -2144,6 +2819,8 @@ void drawStockScreen() {
   stockDirty = false;
 
   if (stockCount == 0) {
+    stockNamesPending = false;
+    stockNamesDrawPending = false;
     if (stockLastCodeHash[0] != 0) {
       for (int i = 0; i < MAX_STOCKS; i++) {
         stockLastCodeHash[i] = 0;
@@ -2167,7 +2844,7 @@ void drawStockScreen() {
     if (codeHash != stockLastCodeHash[i]) {
       stockLastCodeHash[i] = codeHash;
       tft.fillRect(0, y0, SCREEN_W, 17, TFT_BLACK);
-      stockNamesDrawnRev = -1; // strip area wiped: re-fetch names
+      stockNamesDrawnRev = 0; // strip area wiped: redraw names from local cache
       if (has) {
         tft.setTextDatum(TL_DATUM);
         tft.setTextColor(0x7BEF, TFT_BLACK);
@@ -2196,9 +2873,17 @@ void drawStockScreen() {
     }
   }
 
-  // CJK name strips, re-fetched when the watchlist (names_rev) changes
-  if (stockNamesRev >= 0 && stockNamesDrawnRev != stockNamesRev) {
-    if (drawStockNames()) stockNamesDrawnRev = stockNamesRev;
+  // Repaint from LittleFS after a page switch. Network is used only if the
+  // stable content revision differs from the cached one.
+  if (stockNamesRev != 0 && stockNamesDrawnRev != stockNamesRev) {
+    if (stockNamesCacheSupported && stockNamesCacheValid &&
+        stockNamesCachedRev == stockNamesRev &&
+        stockNamesCacheCount == stockCount) {
+      stockNamesDrawPending = true;
+      stockNamesPending = false;
+    } else {
+      stockNamesPending = true;
+    }
   }
 }
 
@@ -2225,6 +2910,26 @@ bool applyWeatherJson(JsonDocument &doc) {
     weather.tomorrowLow = doc["tomorrow_low"] | 0.0;
     weather.tomorrowCode = doc["tomorrow_code"] | 0;
   }
+  const uint32_t incomingTextRev = doc["text_rev"] | (uint32_t)0;
+  if (incomingTextRev != 0) {
+    weatherTextLegacyRaw = false;
+    weatherTextRev = incomingTextRev;
+    if (!weatherTextCacheValid || weatherTextCachedRev != weatherTextRev) {
+      weatherTextPending = true;
+      weatherTextRetryAtMs = 0;
+    } else {
+      weatherTextPending = false;
+      weatherTextFailures = 0;
+      weatherTextRetryAtMs = 0;
+      if (diagnosticEffectiveMode == MODE_WEATHER) weatherTextDrawPending = true;
+    }
+  } else {
+    // New firmware remains usable with a pre-v0.5.16 bridge. The legacy raw
+    // strip is requested once per weather-page visit, never from draw code.
+    weatherTextLegacyRaw = true;
+    weatherTextRev = 0;
+    if (diagnosticEffectiveMode == MODE_WEATHER) weatherTextPending = true;
+  }
   weatherDirty = true;
   return true;
 }
@@ -2234,19 +2939,25 @@ bool handleWeatherPayload(const String &payload) {
   return !deserializeJson(doc, payload) && applyWeatherJson(doc);
 }
 
-void pollWeather() {
-  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return;
+bool pollWeather() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
   WiFiClient client;
   HTTPClient http;
   String url = "http://" + bridgeHost + "/weather";
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return;
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, url)) { noteRequestResult(-1001); client.stop(); return false; }
+  markRequestPhase(REQUEST_SENDING);
   const int code = http.GET();
+  noteRequestResult(code, http.getSize());
+  bool ok = false;
   if (code == HTTP_CODE_OK) {
+    markRequestPhase(REQUEST_PARSING);
     JsonDocument doc;
-    if (!deserializeJson(doc, *http.getStreamPtr())) applyWeatherJson(doc);
+    if (!deserializeJson(doc, *http.getStreamPtr())) ok = applyWeatherJson(doc);
   }
-  http.end();
+  closeTrackedHttp(http, client);
+  return ok;
 }
 
 bool weatherCodeHasRain(int code) {
@@ -2320,21 +3031,268 @@ bool drawWeatherTextStrip(WiFiClient *stream, int x, int y, int w, int h) {
 // Chinese city/date/condition labels are rendered by AppKit on the Mac and
 // streamed as five small RGB565 strips, avoiding a multi-hundred-KB CJK font
 // in ESP8266 flash.
-bool drawWeatherChineseText() {
+bool drawWeatherChineseTextRaw() {
   if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0) return false;
   WiFiClient client;
   HTTPClient http;
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, "http://" + bridgeHost + "/weather/text.raw")) return false;
-  if (http.GET() != HTTP_CODE_OK) { http.end(); return false; }
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, "http://" + bridgeHost + "/weather/text.raw")) {
+    noteRequestResult(-1001); client.stop(); return false;
+  }
+  markRequestPhase(REQUEST_SENDING);
+  const int code = http.GET();
+  noteRequestResult(code, http.getSize());
+  if (code != HTTP_CODE_OK) { closeTrackedHttp(http, client); return false; }
+  markRequestPhase(REQUEST_READING);
   WiFiClient *stream = http.getStreamPtr();
   bool ok = drawWeatherTextStrip(stream, 0, 0, 108, 32) &&
             drawWeatherTextStrip(stream, 108, 0, 132, 32) &&
             drawWeatherTextStrip(stream, 107, 139, 130, 22) &&
             drawWeatherTextStrip(stream, 42, 177, 78, 28) &&
             drawWeatherTextStrip(stream, 162, 177, 78, 28);
-  http.end();
+  closeTrackedHttp(http, client);
   return ok;
+}
+
+const uint32_t WEATHER_TEXT_EXPECTED_PIXELS =
+    108UL * 32UL + 132UL * 32UL + 130UL * 22UL + 78UL * 28UL * 2UL;
+const size_t WEATHER_TEXT_HEADER_BYTES = 16;
+
+uint32_t weatherReadU32BE(const uint8_t *data) {
+  return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+         ((uint32_t)data[2] << 8) | data[3];
+}
+
+uint32_t weatherCrc32Byte(uint32_t crc, uint8_t value) {
+  crc ^= value;
+  for (int bit = 0; bit < 8; ++bit) {
+    crc = (crc >> 1) ^ ((crc & 1U) ? 0xEDB88320UL : 0U);
+  }
+  return crc;
+}
+
+bool validateWeatherTextFile(const char *path, uint32_t desiredRev,
+                             uint32_t &revisionOut) {
+  File file = LittleFS.open(path, "r");
+  if (!file || file.size() < WEATHER_TEXT_HEADER_BYTES + 3 ||
+      file.size() > WEATHER_TEXT_RLE_MAX_BYTES) {
+    if (file) file.close();
+    return false;
+  }
+  uint8_t header[WEATHER_TEXT_HEADER_BYTES] = {};
+  if (file.read(header, sizeof(header)) != (int)sizeof(header) ||
+      memcmp(header, "WTR1", 4) != 0) {
+    file.close();
+    return false;
+  }
+  const uint32_t revision = weatherReadU32BE(header + 4);
+  const uint32_t pixels = weatherReadU32BE(header + 8);
+  const uint32_t expectedCrc = weatherReadU32BE(header + 12);
+  if (revision == 0 || pixels != WEATHER_TEXT_EXPECTED_PIXELS ||
+      (desiredRev != 0 && revision != desiredRev)) {
+    file.close();
+    return false;
+  }
+
+  uint32_t emitted = 0;
+  uint32_t crc = 0xFFFFFFFFUL;
+  while (file.available()) {
+    uint8_t record[3] = {};
+    if (file.read(record, sizeof(record)) != (int)sizeof(record) || record[0] == 0 ||
+        emitted + record[0] > WEATHER_TEXT_EXPECTED_PIXELS) {
+      file.close();
+      return false;
+    }
+    crc = weatherCrc32Byte(crc, record[0]);
+    crc = weatherCrc32Byte(crc, record[1]);
+    crc = weatherCrc32Byte(crc, record[2]);
+    emitted += record[0];
+    yield();
+  }
+  file.close();
+  revisionOut = revision;
+  return emitted == WEATHER_TEXT_EXPECTED_PIXELS && (~crc) == expectedCrc;
+}
+
+bool installWeatherTextCache(const char *temporaryPath, uint32_t revision) {
+  uint32_t validatedRevision = 0;
+  if (!validateWeatherTextFile(temporaryPath, revision, validatedRevision)) {
+    LittleFS.remove(temporaryPath);
+    return false;
+  }
+  LittleFS.remove(WEATHER_TEXT_CACHE_BACKUP_FILE);
+  const bool hadCache = LittleFS.exists(WEATHER_TEXT_CACHE_FILE);
+  if (hadCache && !LittleFS.rename(WEATHER_TEXT_CACHE_FILE,
+                                   WEATHER_TEXT_CACHE_BACKUP_FILE)) {
+    LittleFS.remove(temporaryPath);
+    return false;
+  }
+  if (!LittleFS.rename(temporaryPath, WEATHER_TEXT_CACHE_FILE)) {
+    if (hadCache) LittleFS.rename(WEATHER_TEXT_CACHE_BACKUP_FILE,
+                                  WEATHER_TEXT_CACHE_FILE);
+    LittleFS.remove(temporaryPath);
+    return false;
+  }
+  LittleFS.remove(WEATHER_TEXT_CACHE_BACKUP_FILE);
+  weatherTextCachedRev = validatedRevision;
+  weatherTextCacheValid = true;
+  return true;
+}
+
+void loadWeatherTextCache() {
+  if (!LittleFS.exists(WEATHER_TEXT_CACHE_FILE) &&
+      LittleFS.exists(WEATHER_TEXT_CACHE_BACKUP_FILE)) {
+    LittleFS.rename(WEATHER_TEXT_CACHE_BACKUP_FILE, WEATHER_TEXT_CACHE_FILE);
+  }
+  uint32_t revision = 0;
+  weatherTextCacheValid = validateWeatherTextFile(
+      WEATHER_TEXT_CACHE_FILE, 0, revision);
+  if (!weatherTextCacheValid && LittleFS.exists(WEATHER_TEXT_CACHE_BACKUP_FILE)) {
+    uint32_t backupRevision = 0;
+    if (validateWeatherTextFile(WEATHER_TEXT_CACHE_BACKUP_FILE, 0,
+                                backupRevision)) {
+      LittleFS.remove(WEATHER_TEXT_CACHE_FILE);
+      if (LittleFS.rename(WEATHER_TEXT_CACHE_BACKUP_FILE,
+                          WEATHER_TEXT_CACHE_FILE)) {
+        weatherTextCacheValid = true;
+        revision = backupRevision;
+      }
+    }
+  }
+  weatherTextCachedRev = weatherTextCacheValid ? revision : 0;
+  LittleFS.remove(WEATHER_TEXT_CACHE_TMP_FILE);
+  if (weatherTextCacheValid) LittleFS.remove(WEATHER_TEXT_CACHE_BACKUP_FILE);
+  Serial.printf("[weather] cache=%s rev=%lu\n",
+                weatherTextCacheValid ? "valid" : "missing",
+                (unsigned long)weatherTextCachedRev);
+}
+
+bool downloadWeatherTextRLE() {
+  if (WiFi.status() != WL_CONNECTED || bridgeHost.length() == 0 ||
+      weatherTextRev == 0) return false;
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, "http://" + bridgeHost + "/weather/text.rle")) {
+    noteRequestResult(-1001); client.stop(); return false;
+  }
+  markRequestPhase(REQUEST_SENDING);
+  const int code = http.GET();
+  const int expectedBytes = http.getSize();
+  noteRequestResult(code, expectedBytes);
+  if (code == HTTP_CODE_NOT_FOUND) weatherTextLegacyRaw = true;
+  if (code != HTTP_CODE_OK || expectedBytes < (int)WEATHER_TEXT_HEADER_BYTES + 3 ||
+      expectedBytes > WEATHER_TEXT_RLE_MAX_BYTES) {
+    closeTrackedHttp(http, client);
+    return false;
+  }
+
+  File output = LittleFS.open(WEATHER_TEXT_CACHE_TMP_FILE, "w");
+  if (!output) {
+    noteRequestResult(-1003);
+    closeTrackedHttp(http, client);
+    return false;
+  }
+  markRequestPhase(REQUEST_READING);
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buffer[256];
+  size_t received = 0;
+  unsigned long deadline = millis() + BRIDGE_HTTP_TIMEOUT_MS;
+  bool ok = true;
+  while (received < (size_t)expectedBytes) {
+    const int available = stream->available();
+    if (available > 0) {
+      const size_t wanted = min((size_t)available,
+                                min(sizeof(buffer), (size_t)expectedBytes - received));
+      const int count = stream->read(buffer, wanted);
+      if (count > 0) {
+        if (output.write(buffer, count) != (size_t)count) { ok = false; break; }
+        received += count;
+        activeRequestBytes = received;
+        deadline = millis() + BRIDGE_HTTP_TIMEOUT_MS;
+        yield();
+        continue;
+      }
+    }
+    if ((long)(millis() - deadline) >= 0) { ok = false; break; }
+    delay(1);
+  }
+  output.close();
+  closeTrackedHttp(http, client);
+  if (!ok || received != (size_t)expectedBytes) {
+    LittleFS.remove(WEATHER_TEXT_CACHE_TMP_FILE);
+    return false;
+  }
+  markRequestPhase(REQUEST_PARSING);
+  return installWeatherTextCache(WEATHER_TEXT_CACHE_TMP_FILE, weatherTextRev);
+}
+
+bool drawWeatherTextFromCache() {
+  if (!weatherTextCacheValid) return false;
+  File file = LittleFS.open(WEATHER_TEXT_CACHE_FILE, "r");
+  if (!file) { weatherTextCacheValid = false; return false; }
+  uint8_t header[WEATHER_TEXT_HEADER_BYTES] = {};
+  if (file.read(header, sizeof(header)) != (int)sizeof(header) ||
+      memcmp(header, "WTR1", 4) != 0 ||
+      weatherReadU32BE(header + 8) != WEATHER_TEXT_EXPECTED_PIXELS) {
+    file.close(); weatherTextCacheValid = false; return false;
+  }
+
+  const int widths[5] = {108, 132, 130, 78, 78};
+  const int heights[5] = {32, 32, 22, 28, 28};
+  const int xs[5] = {0, 108, 107, 42, 162};
+  const int ys[5] = {0, 0, 139, 177, 177};
+  int strip = 0, row = 0, column = 0;
+  uint32_t emitted = 0;
+  bool ok = true;
+  while (file.available() && emitted < WEATHER_TEXT_EXPECTED_PIXELS) {
+    uint8_t record[3] = {};
+    if (file.read(record, sizeof(record)) != (int)sizeof(record) || record[0] == 0 ||
+        emitted + record[0] > WEATHER_TEXT_EXPECTED_PIXELS) {
+      ok = false;
+      break;
+    }
+    // Match the byte order produced when the raw big-endian stream is read
+    // directly into the little-endian uint16_t row buffer. pushImage() then
+    // receives the same pre-swapped value used by the other image pipelines.
+    const uint16_t pixel = (uint16_t)record[1] | ((uint16_t)record[2] << 8);
+    for (uint16_t n = 0; n < record[0]; ++n) {
+      if (strip >= 5) { ok = false; break; }
+      rowBuf[column++] = pixel;
+      emitted++;
+      if (column == widths[strip]) {
+        tft.pushImage(xs[strip], ys[strip] + row, widths[strip], 1, rowBuf);
+        column = 0;
+        if (++row == heights[strip]) { row = 0; strip++; }
+        yield();
+      }
+    }
+  }
+  file.close();
+  return ok && emitted == WEATHER_TEXT_EXPECTED_PIXELS && strip == 5 && column == 0;
+}
+
+unsigned long weatherTextRetryDelayMs() {
+  if (weatherTextFailures <= 1) return 10000UL;
+  if (weatherTextFailures == 2) return 30000UL;
+  return 300000UL;
+}
+
+bool updateWeatherTextAsset() {
+  const bool ok = weatherTextLegacyRaw ? drawWeatherChineseTextRaw()
+                                       : downloadWeatherTextRLE();
+  if (ok) {
+    weatherTextFailures = 0;
+    weatherTextRetryAtMs = 0;
+    weatherTextPending = false;
+    if (!weatherTextLegacyRaw) weatherTextDrawPending = true;
+    return true;
+  }
+  if (weatherTextFailures < 255) weatherTextFailures++;
+  weatherTextRetryAtMs = millis() + weatherTextRetryDelayMs();
+  return false;
 }
 
 void drawWeatherScreen(bool force) {
@@ -2381,7 +3339,6 @@ void drawWeatherScreen(bool force) {
     tft.setTextColor(cool, footer);
     tft.drawString(weather.valid ? String((int)round(low)) : "--", x + 87, 207, 2);
   }
-  drawWeatherChineseText();
 }
 
 // ---------- full-screen K-line frame ----------
@@ -2504,7 +3461,6 @@ void drawMarketFrame(const uint8_t *frame, size_t frameBytes) {
 }
 
 bool fetchMarketFrame(uint64_t expectedVersion, size_t advertisedBytes, bool palette4) {
-  saveRuntimeStage(STAGE_MARKET_FRAME);
   if (advertisedBytes < MARKET_PACKED_HEADER_BYTES ||
       advertisedBytes > MARKET_PACKED_MAX_BYTES) return false;
   // Leave enough contiguous heap for HTTP/TCP and the rest of the firmware.
@@ -2522,14 +3478,20 @@ bool fetchMarketFrame(uint64_t expectedVersion, size_t advertisedBytes, bool pal
   String url = "http://" + bridgeHost + (palette4 ? "/market/frame.pal" : "/market/frame.rle");
   http.setTimeout(MARKET_HTTP_TIMEOUT_MS);
   bool ok = false;
+  markRequestPhase(REQUEST_CONNECTING);
   if (http.begin(client, url)) {
+    markRequestPhase(REQUEST_SENDING);
     const int code = http.GET();
     const int actualBytes = http.getSize();
+    noteRequestResult(code, actualBytes);
     if (code == HTTP_CODE_OK && actualBytes == (int)advertisedBytes) {
+      markRequestPhase(REQUEST_READING);
       WiFiClient *stream = http.getStreamPtr();
       if (readMarketExact(stream, frame, advertisedBytes, MARKET_TOTAL_TIMEOUT_MS)) {
+        markRequestPhase(REQUEST_PARSING);
         uint64_t version = 0;
         if (validateMarketFrame(frame, advertisedBytes, expectedVersion, version)) {
+          markRequestPhase(REQUEST_RENDERING);
           drawMarketFrame(frame, advertisedBytes);
           lastMarketFrameVersion = version;
           ok = true;
@@ -2539,26 +3501,30 @@ bool fetchMarketFrame(uint64_t expectedVersion, size_t advertisedBytes, bool pal
         }
       }
     }
-    http.end();
-  }
+    closeTrackedHttp(http, client);
+  } else { noteRequestResult(-1001); client.stop(); }
   free(frame);
   if (!ok) Serial.println("[market] frame rejected; keeping previous screen");
   return ok;
 }
 
-void pollMarket() {
-  if (!networkTrafficReady() || bridgeHost.length() == 0) return;
+bool pollMarket() {
+  if (!networkTrafficReady() || bridgeHost.length() == 0) return false;
   WiFiClient client;
   HTTPClient http;
   String url = "http://" + bridgeHost + "/market/version";
   http.setTimeout(MARKET_HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return;
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, url)) { noteRequestResult(-1001); client.stop(); return false; }
+  markRequestPhase(REQUEST_SENDING);
   const int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); return; }
+  noteRequestResult(code, http.getSize());
+  if (code != HTTP_CODE_OK) { closeTrackedHttp(http, client); return false; }
+  markRequestPhase(REQUEST_PARSING);
   JsonDocument doc;
   const DeserializationError err = deserializeJson(doc, *http.getStreamPtr());
-  http.end();
-  if (err) return;
+  closeTrackedHttp(http, client);
+  if (err) return false;
   const char *session = doc["session"] | "";
   const int favoriteCount = doc["favorite_count"] | 0;
   const int refreshSeconds = doc["refresh_seconds"] | 0;
@@ -2579,11 +3545,16 @@ void pollMarket() {
   const size_t legacyBytes = doc["packed_bytes"] | (size_t)0;
   if (version > lastMarketFrameVersion) {
     if (strcmp(paletteCodec, "rgb565-palette4-rle-v1") == 0 && paletteBytes > 0) {
-      fetchMarketFrame(version, paletteBytes, true);
+      pendingMarketFrameVersion = version;
+      pendingMarketFrameBytes = paletteBytes;
+      pendingMarketFramePalette4 = true;
     } else if (strcmp(legacyCodec, "rgb565-packbits-v1") == 0) {
-      fetchMarketFrame(version, legacyBytes, false);
+      pendingMarketFrameVersion = version;
+      pendingMarketFrameBytes = legacyBytes;
+      pendingMarketFramePalette4 = false;
     }
   }
+  return true;
 }
 
 // ---------- WiFi / bridge polling ----------
@@ -2621,6 +3592,14 @@ void setupWiFi() {
         wifiDisconnectCount++;
         lastWifiDisconnectReason = (uint8_t)event.reason;
         lastDisconnectWasRecovery = recoveryGenerated;
+        const bool authTimeout = lastWifiDisconnectReason == 15 ||
+                                 lastWifiDisconnectReason == 16 ||
+                                 lastWifiDisconnectReason == 204;
+        if (authTimeout && !recoveryGenerated) {
+          wifiAuthRecoveryPending = true;
+          wifiAuthRecoveryDone = false;
+          wifiAuthRecoveryAtMs = now + 1500UL;
+        }
         if (wifiEverGotIp && !wifiOutageActive) {
           wifiOutageActive = true;
           firstWifiDisconnectReason = lastWifiDisconnectReason;
@@ -2632,6 +3611,7 @@ void setupWiFi() {
           if (!recoveryGenerated) {
             wifiRecoveryMask = 0;
             quickRecoveryAtMs = wifiReinitAtMs = radioResetAtMs = protectiveRestartAtMs = 0;
+            authRejoinAtMs = 0;
           }
           lastWifiOutageDurationMs = 0;
         }
@@ -2660,6 +3640,9 @@ void setupWiFi() {
         wifiSoftRecoveryDone = false;
         wifiHardRecoveryDone = false;
         wifiRadioRecoveryDone = false;
+        wifiAuthRecoveryPending = false;
+        wifiAuthRecoveryDone = false;
+        wifiAuthRecoveryAtMs = 0;
         rtcRuntimeDiag.recoveryStep = RECOVERY_NONE;
         syncWifiEvidenceToRtc();
         rtcRuntimeDiag.wifiReconnectCount = wifiReconnectCount;
@@ -2759,33 +3742,72 @@ bool selectEffectivePet(DisplayMode eff) {
   return updateActiveApp();
 }
 
-void pollBridge() {
+unsigned long bridgeRetryIntervalMs(DisplayMode eff = MODE_AUTO) {
+  const unsigned long normalInterval = (eff == MODE_STOCK || eff == MODE_MARKET)
+      ? BRIDGE_DATA_PAGE_POLL_INTERVAL_MS : BRIDGE_POLL_INTERVAL_MS;
+  if (bridgeConsecutiveFailures < 3) return normalInterval;
+  if (bridgeConsecutiveFailures < 6) return 10000UL;
+  if (bridgeConsecutiveFailures < 11) return 30000UL;
+  return 60000UL;
+}
+
+bool pollBridgeHealth() {
+  if (!networkTrafficReady() || bridgeHost.length() == 0) return false;
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, "http://" + bridgeHost + "/health")) {
+    noteRequestResult(-1001); client.stop(); lastBridgeHealthHttpCode = -1001; return false;
+  }
+  markRequestPhase(REQUEST_SENDING);
+  const int code = http.GET();
+  lastBridgeHealthHttpCode = code;
+  noteRequestResult(code, http.getSize());
+  bool ok = false;
+  if (code == HTTP_CODE_OK) {
+    markRequestPhase(REQUEST_PARSING);
+    JsonDocument doc;
+    ok = !deserializeJson(doc, *http.getStreamPtr()) && (doc["ok"] | false);
+  }
+  closeTrackedHttp(http, client);
+  lastBridgeHealthHealthy = ok;
+  return ok;
+}
+
+bool pollBridge() {
   if (!networkTrafficReady() || bridgeHost.length() == 0) {
     Serial.printf("[bridge] skip poll: wifi=%d host='%s'\n", WiFi.status() == WL_CONNECTED, bridgeHost.c_str());
-    return;
+    return false;
   }
 
-  saveRuntimeStage(STAGE_BRIDGE);
   WiFiClient client;
   HTTPClient http;
   String url = "http://" + bridgeHost + BRIDGE_DEFAULT_PATH;
   http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
 
+  markRequestPhase(REQUEST_CONNECTING);
   if (!http.begin(client, url)) {
     Serial.println("[bridge] http.begin() failed");
     recordBridgeFailure(-1001);
-    saveRuntimeStage(STAGE_IDLE);
-    return;
+    noteRequestResult(-1001);
+    client.stop();
+    return false;
   }
+  markRequestPhase(REQUEST_SENDING);
   int code = http.GET();
+  noteRequestResult(code, http.getSize());
   lastBridgeHttpCode = code;
+  bool ok = false;
   Serial.printf("[bridge] GET %s -> %d\n", url.c_str(), code);
   if (code == HTTP_CODE_OK) {
+    markRequestPhase(REQUEST_PARSING);
     JsonDocument doc;
     if (!deserializeJson(doc, *http.getStreamPtr()) && applyStatusJson(doc)) {
       lastSuccessMs = millis();
       everPolled = true;
       recordBridgeSuccess();
+      ok = true;
       Serial.printf("[bridge] claude=%s tok=%ld | codex=%s tok=%ld primary=%.0f%%\n",
                     claudeStatus.status, claudeStatus.tokensToday,
                     codexStatus.status, codexStatus.tokensToday, codexStatus.primaryPct);
@@ -2798,8 +3820,7 @@ void pollBridge() {
     strlcpy(claudeStatus.status, "offline", sizeof(claudeStatus.status));
     strlcpy(codexStatus.status, "offline", sizeof(codexStatus.status));
   }
-  http.end();
-  saveRuntimeStage(STAGE_IDLE);
+  closeTrackedHttp(http, client);
   DisplayMode eff = effectiveMode();
   if (eff != MODE_NET && eff != MODE_MUSIC && eff != MODE_STOCK &&
       eff != MODE_MARKET && eff != MODE_WEATHER) {
@@ -2808,6 +3829,49 @@ void pollBridge() {
     if (selectEffectivePet(eff)) drawActiveApp();
     else refreshActiveApp();
   }
+  return ok;
+}
+
+bool sendBootDiagnosticReport() {
+  if (!networkTrafficReady() || bridgeHost.length() == 0) return false;
+  JsonDocument doc;
+  doc["firmware"] = FW_VERSION;
+  doc["core_version"] = ESP.getCoreVersion();
+  doc["build_variant"] = FW_CORE_AB_LABEL;
+  doc["boot_count"] = bootCount;
+  doc["reset_reason"] = lastResetReason;
+  doc["reset_info"] = lastResetInfo;
+  doc["previous_stage"] = runtimeStageName(previousRuntimeStage);
+  doc["previous_mode"] = runtimeModeName(previousRuntimeMode);
+  doc["previous_network_task"] = networkTaskName(previousNetworkTask);
+  doc["previous_request_phase"] = requestPhaseName(previousRequestPhase);
+  doc["previous_request_code"] = previousRequestCode;
+  doc["previous_request_duration_ms"] = previousRequestDurationMs;
+  doc["previous_request_bytes"] = previousRequestBytes;
+  doc["previous_request_free_heap"] = previousRequestFreeHeap;
+  doc["previous_request_max_block"] = previousRequestMaxBlock;
+  doc["previous_first_disconnect_reason"] = previousFirstWifiDisconnectReason;
+  doc["previous_last_disconnect_reason"] = previousLastWifiDisconnectReason;
+  doc["previous_outage_ms"] = previousOutageDurationMs;
+  doc["device_ip"] = WiFi.localIP().toString();
+  doc["rssi"] = WiFi.RSSI();
+  String body;
+  serializeJson(doc, body);
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(BRIDGE_HTTP_TIMEOUT_MS);
+  markRequestPhase(REQUEST_CONNECTING);
+  if (!http.begin(client, "http://" + bridgeHost + "/device/boot-report")) {
+    noteRequestResult(-1001); client.stop(); return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  markRequestPhase(REQUEST_SENDING);
+  const int code = http.POST((uint8_t *)body.c_str(), body.length());
+  noteRequestResult(code, http.getSize());
+  const bool ok = code == HTTP_CODE_OK;
+  closeTrackedHttp(http, client);
+  return ok;
 }
 
 // ---------- wired (USB serial) bridge link ----------
@@ -2824,6 +3888,134 @@ char serialLine[1600]; // biggest frame is #STATUS at ~600 bytes
 size_t serialLineLen = 0;
 
 bool wiredActive() { return wiredEverLinked && (millis() - lastSerialFrameMs) < 15000UL; }
+
+// Runs at most one outbound HTTP transaction per Arduino loop iteration. The
+// old implementation could perform status + weather + page metadata + a large
+// binary asset back-to-back after one slow request returned, which starved the
+// ESP8266 SDK and correlated with Software Watchdog resets. Metadata and binary
+// assets are now separate queue entries and every transaction gets a short
+// scheduler gap plus a persistent request breadcrumb.
+bool runOneNetworkTask(unsigned long nowMs, DisplayMode eff) {
+  if (wiredActive() || !networkTrafficReady() || bridgeHost.length() == 0) return false;
+  if (activeNetworkTask != NET_TASK_NONE) return false;
+  if (nextNetworkTaskAtMs != 0 && (long)(nowMs - nextNetworkTaskAtMs) < 0) return false;
+
+  NetworkTask task = NET_TASK_NONE;
+  if (eff == MODE_MARKET && pendingMarketFrameVersion > lastMarketFrameVersion &&
+      nowMs - lastMarketFrameAttemptMs >= 5000UL) {
+    task = NET_TASK_MARKET_FRAME;
+  } else if (eff == MODE_WEATHER &&
+             (lastWeatherPollMs == 0 ||
+              nowMs - lastWeatherPollMs >= WEATHER_POLL_INTERVAL_MS)) {
+    // Metadata owns text_rev, so it must run before deciding whether a new
+    // compressed text asset is needed.
+    task = NET_TASK_WEATHER_META;
+  } else if (eff == MODE_MUSIC && musicCoverPending && musicHasArtwork &&
+             nowMs - lastMusicCoverAttemptMs >= 5000UL) {
+    task = NET_TASK_MUSIC_COVER;
+  } else if (eff == MODE_MUSIC && musicTextPending &&
+             nowMs - lastMusicTextAttemptMs >= 5000UL) {
+    task = NET_TASK_MUSIC_TEXT;
+  } else if (eff == MODE_STOCK && stockNamesPending &&
+             (stockNamesRetryAtMs == 0 ||
+              (long)(nowMs - stockNamesRetryAtMs) >= 0)) {
+    task = NET_TASK_STOCK_NAMES;
+  } else if (eff == MODE_WEATHER && weatherTextPending &&
+             (weatherTextRetryAtMs == 0 ||
+              (long)(nowMs - weatherTextRetryAtMs) >= 0)) {
+    task = NET_TASK_WEATHER_TEXT;
+  } else if (eff == MODE_NET && nowMs - lastNetPollMs >= NET_POLL_INTERVAL_MS) {
+    task = NET_TASK_NET;
+  } else if (eff == MODE_MUSIC && nowMs - lastMusicPollMs >= MUSIC_POLL_INTERVAL_MS) {
+    task = NET_TASK_MUSIC_META;
+  } else if (eff == MODE_STOCK && nowMs - lastStockPollMs >= STOCK_POLL_INTERVAL_MS) {
+    task = NET_TASK_STOCK_META;
+  } else if (eff == MODE_MARKET && nowMs - lastMarketPollMs >= MARKET_POLL_INTERVAL_MS) {
+    task = NET_TASK_MARKET_META;
+  } else if (bridgeConsecutiveFailures >= 3 &&
+             nowMs - lastBridgeHealthPollMs >= 30000UL) {
+    task = NET_TASK_HEALTH;
+  } else if (everPolled && bootReportPending &&
+             (lastBootReportAttemptMs == 0 || nowMs - lastBootReportAttemptMs >= 60000UL)) {
+    task = NET_TASK_BOOT_REPORT;
+  } else if (nowMs - lastPollMs >= bridgeRetryIntervalMs(eff)) {
+    task = NET_TASK_BRIDGE;
+  } else if (lastWeatherPollMs == 0 ||
+             nowMs - lastWeatherPollMs >= WEATHER_POLL_INTERVAL_MS) {
+    task = NET_TASK_WEATHER_META;
+  }
+  if (task == NET_TASK_NONE) return false;
+
+  beginNetworkRequest(task);
+  bool ok = false;
+  switch (task) {
+    case NET_TASK_BRIDGE:
+      lastPollMs = nowMs;
+      ok = pollBridge();
+      break;
+    case NET_TASK_HEALTH:
+      lastBridgeHealthPollMs = nowMs;
+      ok = pollBridgeHealth();
+      if (ok) lastPollMs = 0; // server is alive: retry the real status promptly
+      break;
+    case NET_TASK_BOOT_REPORT:
+      lastBootReportAttemptMs = nowMs;
+      ok = sendBootDiagnosticReport();
+      if (ok) bootReportPending = false;
+      break;
+    case NET_TASK_NET:
+      lastNetPollMs = nowMs;
+      ok = pollNet();
+      break;
+    case NET_TASK_MUSIC_META:
+      lastMusicPollMs = nowMs;
+      ok = pollMusic();
+      break;
+    case NET_TASK_MUSIC_COVER:
+      lastMusicCoverAttemptMs = nowMs;
+      ok = drawMusicCoverFromBridge();
+      if (ok) musicCoverPending = false;
+      break;
+    case NET_TASK_MUSIC_TEXT:
+      lastMusicTextAttemptMs = nowMs;
+      ok = drawMusicTextFromBridge();
+      if (ok) musicTextPending = false;
+      break;
+    case NET_TASK_STOCK_META:
+      lastStockPollMs = nowMs;
+      ok = pollStock();
+      break;
+    case NET_TASK_STOCK_NAMES:
+      lastStockNamesAttemptMs = nowMs;
+      ok = updateStockNamesAsset();
+      break;
+    case NET_TASK_WEATHER_META:
+      lastWeatherPollMs = nowMs;
+      ok = pollWeather();
+      break;
+    case NET_TASK_WEATHER_TEXT:
+      lastWeatherTextAttemptMs = nowMs;
+      ok = updateWeatherTextAsset();
+      break;
+    case NET_TASK_MARKET_META:
+      lastMarketPollMs = nowMs;
+      ok = pollMarket();
+      break;
+    case NET_TASK_MARKET_FRAME:
+      lastMarketFrameAttemptMs = nowMs;
+      ok = fetchMarketFrame(pendingMarketFrameVersion, pendingMarketFrameBytes,
+                            pendingMarketFramePalette4);
+      if (ok) {
+        pendingMarketFrameVersion = 0;
+        pendingMarketFrameBytes = 0;
+      }
+      break;
+    default:
+      break;
+  }
+  finishNetworkRequest(ok);
+  return true;
+}
 
 // First data over either transport replaces the boot/portal screen.
 void showMainUiIfNeeded() {
@@ -2974,6 +4166,7 @@ void handleRoot() {
   webServer.sendContent_P(PSTR("</td></tr><tr><td>上次数据更新</td><td>"));
   webServer.sendContent(everPolled ? String((millis() - lastSuccessMs) / 1000) + " 秒前" : "从未");
   webServer.sendContent_P(PSTR("</td></tr><tr><td>固件版本</td><td>" FW_VERSION
+      "</td></tr><tr><td>核心版本</td><td>" FW_CORE_AB_LABEL
       "</td></tr><tr><td>桥接版本</td><td>"));
   webServer.sendContent(htmlEscape(bridgeVersion));
   webServer.sendContent_P(PSTR("</td></tr><tr><td>本次启动原因</td><td>"));
@@ -3001,13 +4194,23 @@ void handleRoot() {
   webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前恢复时间线</td><td>"));
   webServer.sendContent(recoveryTimelineText(previousQuickRecoveryAtMs,
                         previousWifiReinitAtMs, previousRadioResetAtMs,
-                        previousProtectiveRestartAtMs));
+                        previousProtectiveRestartAtMs, previousAuthRejoinAtMs));
   webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前断线 / 重连</td><td>"));
   webServer.sendContent(String(previousWifiDisconnectCount) + " / " +
                         String(previousWifiReconnectCount));
   webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前桥接失败 / HTTP</td><td>"));
   webServer.sendContent(String(previousBridgeFailures) + " / " +
                         String(previousBridgeHttpCode));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前网络任务</td><td>"));
+  webServer.sendContent(String(networkTaskName(previousNetworkTask)) + " / " +
+                        requestPhaseName(previousRequestPhase));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前请求结果</td><td>"));
+  webServer.sendContent(String(previousRequestCode) + " / " +
+                        String(previousRequestDurationMs) + " ms / " +
+                        String(previousRequestBytes) + " B");
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>重启前请求内存</td><td>"));
+  webServer.sendContent(String(previousRequestFreeHeap / 1024UL) + " KB / 最大块 " +
+                        String(previousRequestMaxBlock / 1024UL) + " KB");
   webServer.sendContent_P(PSTR("</td></tr><tr><td>Wi-Fi 内部状态</td><td>"));
   webServer.sendContent(String(wifiStatusName((uint8_t)WiFi.status())) + " (" +
                         String((int)WiFi.status()) + ")");
@@ -3025,15 +4228,39 @@ void handleRoot() {
   webServer.sendContent(String(currentWifiOutageDurationMs() / 1000UL) + " 秒");
   webServer.sendContent_P(PSTR("</td></tr><tr><td>本次恢复时间线</td><td>"));
   webServer.sendContent(recoveryTimelineText(quickRecoveryAtMs, wifiReinitAtMs,
-                        radioResetAtMs, protectiveRestartAtMs));
+                        radioResetAtMs, protectiveRestartAtMs, authRejoinAtMs));
   webServer.sendContent_P(PSTR("</td></tr><tr><td>断线 / 重连次数</td><td>"));
   webServer.sendContent(String(wifiDisconnectCount) + " / " + String(wifiReconnectCount));
   webServer.sendContent_P(PSTR("</td></tr><tr><td>桥接连续 / 累计失败</td><td>"));
   webServer.sendContent(String(bridgeConsecutiveFailures) + " / " + String(bridgeTotalFailures));
   webServer.sendContent_P(PSTR("</td></tr><tr><td>最近桥接 HTTP 结果</td><td>"));
   webServer.sendContent(String(lastBridgeHttpCode));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>桥接健康检查</td><td>"));
+  webServer.sendContent(String(lastBridgeHealthHealthy ? "正常" : "未知/失败") +
+                        " / HTTP " + String(lastBridgeHealthHttpCode));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>网络请求成功 / 失败</td><td>"));
+  webServer.sendContent(String(networkRequestCount - networkRequestFailures) + " / " +
+                        String(networkRequestFailures));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>最近网络任务 / 阶段</td><td>"));
+  webServer.sendContent(String(networkTaskName(rtcRuntimeDiag.networkTask)) + " / " +
+                        requestPhaseName(rtcRuntimeDiag.requestPhase));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>最近请求结果</td><td>"));
+  webServer.sendContent(String(rtcRuntimeDiag.requestCode) + " / " +
+                        String(rtcRuntimeDiag.requestDurationMs) + " ms / " +
+                        String(rtcRuntimeDiag.requestBytes) + " B");
   webServer.sendContent_P(PSTR("</td></tr><tr><td>最近恢复动作</td><td>"));
   webServer.sendContent(htmlEscape(lastRecoveryAction));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>四行报价名称缓存</td><td>"));
+  webServer.sendContent(String(stockNamesCacheValid ? "有效" : "无") +
+                        " / 本地 " + String(stockNamesCachedRev) +
+                        " / 桥接 " + String(stockNamesRev) +
+                        " / 行数 " + String(stockNamesCacheCount) +
+                        " / 失败 " + String(stockNamesFailures));
+  webServer.sendContent_P(PSTR("</td></tr><tr><td>天气文字缓存</td><td>"));
+  webServer.sendContent(String(weatherTextCacheValid ? "有效" : "无") +
+                        " / 本地 " + String(weatherTextCachedRev) +
+                        " / 桥接 " + String(weatherTextRev) +
+                        " / 失败 " + String(weatherTextFailures));
   for (uint8_t i = 0; i < restartHistory.count; ++i) {
     const RestartHistoryEntry &entry = restartHistory.entries[i];
     webServer.sendContent_P(PSTR("</td></tr><tr><td>历史重启 #"));
@@ -3043,7 +4270,10 @@ void handleRoot() {
                           "/" + runtimeModeName(entry.mode) + " · 首次原因 " +
                           String((unsigned)entry.firstReason) + "（" +
                           disconnectOriginName(entry.firstWasRecovery != 0) + "）· " +
-                          String(entry.outageDurationMs / 1000UL) + "秒");
+                          String(entry.outageDurationMs / 1000UL) + "秒 · " +
+                          networkTaskName(entry.networkTask) + "/" +
+                          requestPhaseName(entry.requestPhase) + " HTTP " +
+                          String(entry.requestCode));
   }
   webServer.sendContent_P(PSTR(
       "</td></tr><tr><td>空闲可用内存</td><td id='heap'>--</td></tr>"
@@ -3096,6 +4326,8 @@ void handleRoot() {
 void handleApiDiagnostics() {
   JsonDocument doc;
   doc["free_heap"] = idleFreeHeap;
+  doc["core_version"] = ESP.getCoreVersion();
+  doc["build_variant"] = FW_CORE_AB_LABEL;
   doc["min_free_heap"] = minimumIdleFreeHeap;
   doc["max_free_block"] = idleMaxFreeBlock;
   doc["fragmentation"] = idleHeapFragmentation;
@@ -3114,11 +4346,20 @@ void handleApiDiagnostics() {
   doc["previous_first_disconnect_bssid"] = wifiBssidText(previousFirstWifiBssid);
   doc["previous_outage_ms"] = previousOutageDurationMs;
   doc["previous_recovery_timeline"] = recoveryTimelineText(previousQuickRecoveryAtMs,
-      previousWifiReinitAtMs, previousRadioResetAtMs, previousProtectiveRestartAtMs);
+      previousWifiReinitAtMs, previousRadioResetAtMs, previousProtectiveRestartAtMs,
+      previousAuthRejoinAtMs);
   doc["previous_wifi_disconnects"] = previousWifiDisconnectCount;
   doc["previous_wifi_reconnects"] = previousWifiReconnectCount;
   doc["previous_bridge_failures"] = previousBridgeFailures;
   doc["previous_bridge_http_code"] = previousBridgeHttpCode;
+  doc["previous_network_task"] = networkTaskName(previousNetworkTask);
+  doc["previous_request_phase"] = requestPhaseName(previousRequestPhase);
+  doc["previous_request_succeeded"] = previousRequestSucceeded;
+  doc["previous_request_code"] = previousRequestCode;
+  doc["previous_request_duration_ms"] = previousRequestDurationMs;
+  doc["previous_request_bytes"] = previousRequestBytes;
+  doc["previous_request_free_heap"] = previousRequestFreeHeap;
+  doc["previous_request_max_block"] = previousRequestMaxBlock;
   doc["wifi_status"] = (int)WiFi.status();
   doc["first_disconnect_reason"] = firstWifiDisconnectReason;
   doc["last_disconnect_reason"] = lastWifiDisconnectReason;
@@ -3129,13 +4370,37 @@ void handleApiDiagnostics() {
   doc["first_disconnect_bssid"] = wifiBssidText(firstWifiDisconnectBssid);
   doc["outage_ms"] = currentWifiOutageDurationMs();
   doc["recovery_timeline"] = recoveryTimelineText(quickRecoveryAtMs, wifiReinitAtMs,
-                                                   radioResetAtMs, protectiveRestartAtMs);
+                                                   radioResetAtMs, protectiveRestartAtMs,
+                                                   authRejoinAtMs);
   doc["wifi_disconnects"] = wifiDisconnectCount;
   doc["wifi_reconnects"] = wifiReconnectCount;
   doc["bridge_consecutive_failures"] = bridgeConsecutiveFailures;
   doc["bridge_total_failures"] = bridgeTotalFailures;
   doc["last_bridge_http_code"] = lastBridgeHttpCode;
+  doc["bridge_retry_ms"] = bridgeRetryIntervalMs(effectiveMode());
+  doc["bridge_health_ok"] = lastBridgeHealthHealthy;
+  doc["bridge_health_http_code"] = lastBridgeHealthHttpCode;
+  doc["network_request_count"] = networkRequestCount;
+  doc["network_request_failures"] = networkRequestFailures;
+  doc["active_network_task"] = networkTaskName((uint8_t)activeNetworkTask);
+  doc["active_request_phase"] = requestPhaseName((uint8_t)activeRequestPhase);
+  doc["last_network_task"] = networkTaskName(rtcRuntimeDiag.networkTask);
+  doc["last_request_phase"] = requestPhaseName(rtcRuntimeDiag.requestPhase);
+  doc["last_request_code"] = rtcRuntimeDiag.requestCode;
+  doc["last_request_duration_ms"] = rtcRuntimeDiag.requestDurationMs;
+  doc["last_request_bytes"] = rtcRuntimeDiag.requestBytes;
   doc["last_recovery_action"] = lastRecoveryAction;
+  doc["stock_names_cache_supported"] = stockNamesCacheSupported;
+  doc["stock_names_cache_valid"] = stockNamesCacheValid;
+  doc["stock_names_cached_rev"] = stockNamesCachedRev;
+  doc["stock_names_bridge_rev"] = stockNamesRev;
+  doc["stock_names_cache_count"] = stockNamesCacheCount;
+  doc["stock_names_failures"] = stockNamesFailures;
+  doc["weather_text_cache_valid"] = weatherTextCacheValid;
+  doc["weather_text_cached_rev"] = weatherTextCachedRev;
+  doc["weather_text_bridge_rev"] = weatherTextRev;
+  doc["weather_text_failures"] = weatherTextFailures;
+  doc["weather_text_legacy_raw"] = weatherTextLegacyRaw;
   JsonArray history = doc["restart_history"].to<JsonArray>();
   for (uint8_t i = 0; i < restartHistory.count; ++i) {
     const RestartHistoryEntry &entry = restartHistory.entries[i];
@@ -3148,9 +4413,22 @@ void handleApiDiagnostics() {
     item["first_reason"] = entry.firstReason;
     item["last_reason"] = entry.lastReason;
     item["first_origin"] = disconnectOriginName(entry.firstWasRecovery != 0);
+    item["last_origin"] = disconnectOriginName(entry.lastWasRecovery != 0);
     item["first_rssi"] = entry.firstRssi;
     item["first_channel"] = entry.firstChannel;
     item["outage_ms"] = entry.outageDurationMs;
+    item["network_task"] = networkTaskName(entry.networkTask);
+    item["request_phase"] = requestPhaseName(entry.requestPhase);
+    item["request_succeeded"] = entry.requestSucceeded != 0;
+    item["request_code"] = entry.requestCode;
+    item["request_duration_ms"] = entry.requestDurationMs;
+    item["request_bytes"] = entry.requestBytes;
+    item["request_free_heap"] = entry.requestFreeHeap;
+    item["request_max_block"] = entry.requestMaxBlock;
+    item["recovery_timeline"] = recoveryTimelineText(entry.quickRecoveryAtMs,
+        entry.wifiReinitAtMs, entry.radioResetAtMs, entry.protectiveRestartAtMs,
+        entry.authRejoinAtMs);
+    item["reset_info"] = entry.resetInfo;
   }
   String body;
   serializeJson(doc, body);
@@ -3203,6 +4481,8 @@ void handleApiInfo() {
   doc["brightness"] = brightness;
   doc["wired"] = wiredActive(); // true = data currently arrives over USB serial
   doc["fw"] = FW_VERSION;
+  doc["core_version"] = ESP.getCoreVersion();
+  doc["build_variant"] = FW_CORE_AB_LABEL;
   doc["bridge_version"] = bridgeVersion;
   doc["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : -127;
   doc["free_heap"] = idleFreeHeap;
@@ -3228,7 +4508,29 @@ void handleApiInfo() {
   doc["bridge_consecutive_failures"] = bridgeConsecutiveFailures;
   doc["bridge_total_failures"] = bridgeTotalFailures;
   doc["last_bridge_http_code"] = lastBridgeHttpCode;
+  doc["bridge_retry_ms"] = bridgeRetryIntervalMs(effectiveMode());
+  doc["bridge_health_ok"] = lastBridgeHealthHealthy;
+  doc["bridge_health_http_code"] = lastBridgeHealthHttpCode;
+  doc["network_request_count"] = networkRequestCount;
+  doc["network_request_failures"] = networkRequestFailures;
+  doc["active_network_task"] = networkTaskName((uint8_t)activeNetworkTask);
+  doc["active_request_phase"] = requestPhaseName((uint8_t)activeRequestPhase);
+  doc["last_network_task"] = networkTaskName(rtcRuntimeDiag.networkTask);
+  doc["last_request_phase"] = requestPhaseName(rtcRuntimeDiag.requestPhase);
+  doc["last_request_code"] = rtcRuntimeDiag.requestCode;
+  doc["last_request_duration_ms"] = rtcRuntimeDiag.requestDurationMs;
+  doc["last_request_bytes"] = rtcRuntimeDiag.requestBytes;
   doc["last_recovery_action"] = lastRecoveryAction;
+  doc["stock_names_cache_supported"] = stockNamesCacheSupported;
+  doc["stock_names_cache_valid"] = stockNamesCacheValid;
+  doc["stock_names_cached_rev"] = stockNamesCachedRev;
+  doc["stock_names_bridge_rev"] = stockNamesRev;
+  doc["stock_names_cache_count"] = stockNamesCacheCount;
+  doc["stock_names_failures"] = stockNamesFailures;
+  doc["weather_text_cache_valid"] = weatherTextCacheValid;
+  doc["weather_text_cached_rev"] = weatherTextCachedRev;
+  doc["weather_text_bridge_rev"] = weatherTextRev;
+  doc["weather_text_failures"] = weatherTextFailures;
   doc["uptime_s"] = millis() / 1000UL;
   doc["ota_space"] = ESP.getFreeSketchSpace();
   FSInfo fsInfo;
@@ -3295,12 +4597,19 @@ void handleApiDisplay() {
   } else if (displayMode == MODE_STOCK) {
     stockChromeDrawn = false;
     lastStockPollMs = 0; // poll + draw on the next loop tick
+    stockNamesDrawPending = false;
   } else if (displayMode == MODE_MARKET) {
     lastMarketPollMs = 0;
     lastMarketFrameVersion = 0; // force a redraw when returning from another page
   } else if (displayMode == MODE_WEATHER) {
     weatherChromeDrawn = false;
-    lastWeatherPollMs = 0;
+    weatherDirty = true;
+    weatherTextDrawPending = weatherTextCacheValid;
+    if (weatherTextLegacyRaw ||
+        (weatherTextRev != 0 &&
+         (!weatherTextCacheValid || weatherTextCachedRev != weatherTextRev))) {
+      weatherTextPending = true;
+    }
   } else {
     updateActiveApp();
     drawActiveApp(); // unconditional: also repaints over a previous net chart
@@ -3476,6 +4785,9 @@ void handleApiSettingsRestore() {
 
 bool otaUploadOK = false;
 bool otaUploadStarted = false;
+bool otaHeaderChecked = false;
+size_t otaBytesWritten = 0;
+size_t otaMaxBytes = 0;
 String otaUploadError;
 unsigned long otaRestartAtMs = 0;
 
@@ -3485,6 +4797,9 @@ void handleOtaUploadChunk() {
     saveRuntimeStage(STAGE_OTA);
     otaUploadOK = false;
     otaUploadStarted = true;
+    otaHeaderChecked = false;
+    otaBytesWritten = 0;
+    otaMaxBytes = 0;
     otaUploadError = "";
     String filename = upload.filename;
     filename.toLowerCase();
@@ -3493,6 +4808,7 @@ void handleOtaUploadChunk() {
       return;
     }
     const size_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    otaMaxBytes = maxSketchSpace;
     if (!Update.begin(maxSketchSpace, U_FLASH)) {
       otaUploadError = "设备没有足够的 OTA 空间";
       return;
@@ -3505,12 +4821,30 @@ void handleOtaUploadChunk() {
     tft.drawString("Uploading...", SCREEN_CX, 110, 2);
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (otaUploadError.length() > 0) return;
+    if (!otaHeaderChecked) {
+      otaHeaderChecked = true;
+      if (upload.currentSize < 4 || upload.buf[0] != 0xE9) {
+        otaUploadError = "文件不是有效的ESP8266固件";
+        Update.end(false);
+        return;
+      }
+    }
+    if (otaBytesWritten + upload.currentSize > otaMaxBytes) {
+      otaUploadError = "固件超过设备可用OTA空间";
+      Update.end(false);
+      return;
+    }
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       otaUploadError = "写入固件失败";
       Update.end(false);
+    } else {
+      otaBytesWritten += upload.currentSize;
     }
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (otaUploadError.length() == 0 && Update.end(true)) {
+    if (otaUploadError.length() == 0 && otaBytesWritten < 100 * 1024UL) {
+      otaUploadError = "固件文件异常小，已拒绝升级";
+      Update.end(false);
+    } else if (otaUploadError.length() == 0 && Update.end(true)) {
       otaUploadOK = true;
     } else if (otaUploadError.length() == 0) {
       otaUploadError = "固件校验失败，设备仍保留旧版本";
@@ -3846,6 +5180,8 @@ void setup() {
   Serial.setRxBufferSize(2048); // a serial #STATUS frame (~600B) must survive a slow draw
   Serial.begin(115200);
   LittleFS.begin();
+  loadStockNamesCache();
+  loadWeatherTextCache();
   loadBootDiagnostics();
   loadBridgeHost();
   loadBrightness();
@@ -3875,7 +5211,7 @@ void setup() {
     delay(3000);
 
     showMainUiIfNeeded();
-    pollBridge();
+    lastPollMs = 0; // scheduler starts only after the 30-second Wi-Fi grace period
   }
   sampleHeapHealth(true);
   saveRuntimeStage(STAGE_IDLE);
@@ -3937,9 +5273,13 @@ void loop() {
     } else if (eff == MODE_MUSIC) {
       musicChromeDrawn = false;
       lastMusicPollMs = 0;
+      musicCoverPending = false;
+      musicTextPending = false;
     } else if (eff == MODE_STOCK) {
       stockChromeDrawn = false;
       lastStockPollMs = 0;
+      stockNamesPending = false;
+      stockNamesDrawPending = false;
     } else if (eff == MODE_MARKET) {
       lastMarketPollMs = 0;
       lastMarketFrameVersion = 0;
@@ -3948,8 +5288,13 @@ void loop() {
     } else if (eff == MODE_WEATHER) {
       weatherChromeDrawn = false;
       weatherDirty = true;
+      weatherTextDrawPending = weatherTextCacheValid;
+      if (weatherTextLegacyRaw ||
+          (weatherTextRev != 0 &&
+           (!weatherTextCacheValid || weatherTextCachedRev != weatherTextRev))) {
+        weatherTextPending = true;
+      }
       lastWeatherClockMs = 0;
-      lastWeatherPollMs = 0;
     } else {
       selectEffectivePet(eff);
       drawActiveApp();
@@ -3963,40 +5308,32 @@ void loop() {
       lastNetDrawMs = nowMs;
       netDrawTick();
     }
-    if (nowMs - lastNetPollMs >= NET_POLL_INTERVAL_MS) {
-      lastNetPollMs = nowMs;
-      saveRuntimeStage(STAGE_NET);
-      pollNet();
-      saveRuntimeStage(STAGE_IDLE);
-    }
   } else if (eff == MODE_MUSIC) {
-    // music now-playing mode: cover art + track metadata from the bridge
-    if (nowMs - lastMusicPollMs >= MUSIC_POLL_INTERVAL_MS) {
-      lastMusicPollMs = nowMs;
-      saveRuntimeStage(STAGE_MUSIC);
-      pollMusic();
-      saveRuntimeStage(STAGE_IDLE);
-    }
+    // Metadata and binary assets are fetched by the single-request scheduler.
   } else if (eff == MODE_STOCK) {
-    // stock watchlist: HTTP poll unless the serial link is pushing #STOCK
-    if (nowMs - lastStockPollMs >= STOCK_POLL_INTERVAL_MS) {
-      lastStockPollMs = nowMs;
-      if (!wiredActive()) {
-        saveRuntimeStage(STAGE_STOCK);
-        pollStock();
-        saveRuntimeStage(STAGE_IDLE);
+    if (!stockChromeDrawn || stockDirty) drawStockScreen();
+    if (stockNamesDrawPending && stockNamesCacheValid) {
+      stockNamesDrawPending = false;
+      if (drawStockNamesFromCache()) {
+        stockNamesDrawnRev = stockNamesCachedRev;
+      } else {
+        stockNamesCacheValid = false;
+        stockNamesCachedRev = 0;
+        stockNamesCacheCount = 0;
+        if (stockNamesRev != 0) stockNamesPending = true;
       }
     }
-    if (!stockChromeDrawn || stockDirty) drawStockScreen();
   } else if (eff == MODE_MARKET) {
-    if (nowMs - lastMarketPollMs >= MARKET_POLL_INTERVAL_MS) {
-      lastMarketPollMs = nowMs;
-      saveRuntimeStage(STAGE_MARKET_META);
-      pollMarket();
-      saveRuntimeStage(STAGE_IDLE);
-    }
+    // Metadata and the large frame are deliberately two separate queue tasks.
   } else if (eff == MODE_WEATHER) {
     if (!weatherChromeDrawn) drawWeatherScreen(true);
+    if (weatherTextDrawPending && weatherTextCacheValid) {
+      weatherTextDrawPending = false;
+      if (!drawWeatherTextFromCache()) {
+        weatherTextCacheValid = false;
+        if (weatherTextRev != 0) weatherTextPending = true;
+      }
+    }
     if (nowMs - lastWeatherClockMs >= 1000UL) {
       lastWeatherClockMs = nowMs;
       drawWeatherScreen(false);
@@ -4045,20 +5382,8 @@ void loop() {
     }
   }
 
-  // status poll continues in every mode (feeds /api/info and the web page).
-  // Wired-first: while serial frames are flowing, skip HTTP polling entirely
-  // (works around AP client isolation, and avoids double updates).
-  if (nowMs - lastPollMs >= BRIDGE_POLL_INTERVAL_MS) {
-    lastPollMs = nowMs;
-    if (!wiredActive()) pollBridge();
-  }
-  // Weather also supplies the city-local clock used to select the weekday or
-  // weekend carousel schedule, so keep it synchronized even when hidden.
-  if (!wiredActive() &&
-      (lastWeatherPollMs == 0 || nowMs - lastWeatherPollMs >= WEATHER_POLL_INTERVAL_MS)) {
-    lastWeatherPollMs = nowMs;
-    saveRuntimeStage(STAGE_WEATHER);
-    pollWeather();
-    saveRuntimeStage(STAGE_IDLE);
-  }
+  // Status, page metadata, text strips and market frames all share one queue.
+  // This call performs zero or one outbound HTTP transaction per loop.
+  runOneNetworkTask(nowMs, eff);
+  delay(0);
 }

@@ -2,6 +2,36 @@ import XCTest
 @testable import AIClockBridge
 
 final class StockMonitorTests: XCTestCase {
+    func testStockNameRevisionIsStableAndContentDerived() {
+        let first = StockMonitor.stableNamesRevision("沪金\n伦敦金")
+        XCTAssertEqual(first, StockMonitor.stableNamesRevision("沪金\n伦敦金"))
+        XCTAssertNotEqual(first, StockMonitor.stableNamesRevision("沪金\n美元指数"))
+        XCTAssertGreaterThan(first, 0)
+    }
+
+    func testStockNameRLEEnvelopeRoundTrips() throws {
+        var raw = Data([1])
+        for index in 0..<(StockMonitor.nameW * StockMonitor.nameH) {
+            let value: UInt16 = index < 2300 ? 0 : (index.isMultiple(of: 2) ? 0x7BEF : 0x0000)
+            raw.append(UInt8(value >> 8))
+            raw.append(UInt8(value & 0xFF))
+        }
+        let packed = StockMonitor.packNamesRLE(raw)
+        XCTAssertEqual(Array(packed.prefix(5)), [0x53, 0x4E, 0x52, 0x31, 1])
+        XCTAssertLessThan(packed.count, raw.count)
+
+        var decoded = Data([packed[4]])
+        var offset = 5
+        while offset + 2 < packed.count {
+            for _ in 0..<Int(packed[offset]) {
+                decoded.append(packed[offset + 1])
+                decoded.append(packed[offset + 2])
+            }
+            offset += 3
+        }
+        XCTAssertEqual(decoded, raw)
+    }
+
     func testMarketPrefixesRouteToProviderCodes() throws {
         let stock = try XCTUnwrap(StockMonitor.parseSymbol(" hk1810 "))
         XCTAssertEqual(stock.key, "hk01810")

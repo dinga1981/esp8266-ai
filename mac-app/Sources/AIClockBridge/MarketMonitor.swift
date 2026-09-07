@@ -491,6 +491,7 @@ final class MarketMonitor {
     private var frameCache: [String: Data] = [:]
     private var inFlightKeys = Set<String>()
     private var retryAfter: [String: TimeInterval] = [:]
+    private var lastBackgroundRefresh = Date.distantPast
     private var frameVersion: UInt64 = 1
     /// Changes on every bridge launch. The device uses this to accept version
     /// counters from a restarted bridge even if the Mac clock moved backward.
@@ -864,6 +865,13 @@ final class MarketMonitor {
     /// first publishes the frame prepared during the previous dwell period;
     /// `setInstrument` then refreshes it and starts preloading its successor.
     private func cadenceTick() {
+        let visible = BridgeDiagnostics.shared.wasRecentlyRequested(
+            paths: ["/market", "/market/version", "/market/frame.pal", "/market/frame.rle"],
+            within: 30)
+        if !visible {
+            guard Date().timeIntervalSince(lastBackgroundRefresh) >= 60 else { return }
+            lastBackgroundRefresh = Date()
+        }
         lock.lock()
         let shouldRotate = favoriteItems.count > 1
         lock.unlock()
